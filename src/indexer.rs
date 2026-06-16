@@ -1,35 +1,41 @@
-use anyhow::Result;
-
 use axum::{
     extract::State,
-    routing::post,
     Json,
-    Router,
 };
 
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use tantivy::{
+    doc,
+    IndexWriter,
+    Term,
+    Index
+};
+
+use crate::init::SearchFields;
+
+use crate::lib::*;
+
 #[derive(Clone)]
-struct AppState {
-    writer: Arc<Mutex<IndexWriter>>,
-    fields: SearchFields,
+pub struct AppState {
+    pub index: Index,
+    pub writer: Arc<Mutex<IndexWriter>>,
+    pub fields: SearchFields,
 }
 
 #[derive(Deserialize)]
-struct IndexDocumentRequest {
-    id: String,
-    tipo: String,
-    titulo: String,
-    subtitulo: String,
-    contenido: String,
-    fecha: String
+pub struct IndexDocumentRequest {
+    pub id: String,
+    pub tipo: String,
+    pub titulo: String,
+    pub subtitulo: String,
+    pub contenido: String,
+    pub fecha: String
 }
 
 #[derive(Serialize)]
-struct ApiResponse {
-    ok: bool,
-}
-
-fn make_uid(tipo: &str, id: &str) -> String {
-    format!("{}:{}", tipo, id)
+pub struct ApiResponse {
+    pub ok: bool,
 }
 
 pub async fn upsert_document(

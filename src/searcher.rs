@@ -3,8 +3,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use crate::indexer::AppState;
 
 use serde::{Deserialize, Serialize};
+
 
 use tantivy::{
     collector::TopDocs,
@@ -18,22 +20,23 @@ use tantivy::{
     schema::IndexRecordOption,
     TantivyDocument,
     Term,
+    Document
 };
 
 #[derive(Deserialize)]
-struct SearchParams {
-    q: String,
-    tipo: Option<String>,
-    limit: Option<usize>,
+pub struct SearchParams {
+    pub q: String,
+    pub tipo: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Serialize)]
-struct SearchResult {
-    score: f32,
-    doc: serde_json::Value,
+pub struct SearchResult {
+    pub score: f32,
+    pub doc: serde_json::Value,
 }
 
-async fn search_documents(
+pub async fn search_documents(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> std::result::Result<Json<Vec<SearchResult>>, (StatusCode, String)> {

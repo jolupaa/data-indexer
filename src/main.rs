@@ -1,5 +1,5 @@
 use anyhow::Result;
-
+mod lib;
 
 mod indexer;
 use indexer::*;
@@ -10,23 +10,34 @@ use searcher::*;
 mod init;
 use init::*;
 
+mod server;
+use server::*;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let state = AppState {
-        writer: Arc::new(Mutex::new(index_writer)),
-        fields,
-    };
+    let command = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "serve".to_string());
 
-    let app = Router::new()
-        .route("/index/upsert", post(upsert_document))
-        .route("/index/delete", delete(delete_document))
-        .route("/search", get(search_documents))
-        .route("/index/init", post(start_indexing()))
-        .with_state(state);
+    match command.as_str() {
+        "reindex" => {
+            println!("Reconstruyendo índice completo...");
+            reindex().await?;
+            println!("Indexación inicial completada.");
+        }
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:4000").await?;
+        "serve" => {
+            println!("Arrancando servidor de búsqueda...");
+            start_server().await?;
+        }
 
-    axum::serve(listener, app).await?;
+        _ => {
+            eprintln!("Comando no reconocido: {}", command);
+            eprintln!("Uso:");
+            eprintln!("  cargo run -- reindex");
+            eprintln!("  cargo run -- serve");
+        }
+    }
 
     Ok(())
 }
