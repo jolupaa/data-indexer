@@ -1,15 +1,32 @@
 use anyhow::Result;
-mod indexers;
 
-use indexers::*;
+
+mod indexer;
+use indexer::*;
+
+mod searcher;
+use searcher::*;
+
+mod init;
+use init::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    let state = AppState {
+        writer: Arc::new(Mutex::new(index_writer)),
+        fields,
+    };
 
-    start_indexing().await?;
+    let app = Router::new()
+        .route("/index/upsert", post(upsert_document))
+        .route("/index/delete", delete(delete_document))
+        .route("/search", get(search_documents))
+        .route("/index/init", post(start_indexing()))
+        .with_state(state);
 
-    println!("Datos indexados correctamente");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:4000").await?;
+
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

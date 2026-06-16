@@ -12,26 +12,31 @@ use tantivy::{
 struct Noticia {
     id: String,
     titulo: String,
+    subtitulo: String,
     contenido: String,
-    autor: Option<String>,
-    fecha: Option<String>,
+    fecha: String,
 }
 
 
 #[derive(sqlx::FromRow)]
 struct InfoDoc {
     id: String,
-    titulo: String,
-    contenido: String
+    info_title: String,
+    title: String,
+    contenido: String,
+    subtitle: String,
+    created_at: String
 }
 
 #[derive(Clone, Copy)]
 pub struct SearchFields {
     id: Field,
+    uid: Field,
     tipo: Field,
+    info_title: Field,
     titulo: Field,
+    subtitulo: Field,
     contenido: Field,
-    autor: Field,
     fecha: Field,
 }
 
@@ -44,21 +49,29 @@ pub async fn start_indexing() -> Result<(), anyhow::Error> {
 
     let fields = SearchFields {
         id: schema_builder.add_text_field("id", STRING | STORED),
+        uid: schema_builder.add_text_field("uid", STRING | STORED),
         tipo: schema_builder.add_text_field("tipo", STRING | STORED),
         titulo: schema_builder.add_text_field("titulo", TEXT | STORED),
         contenido: schema_builder.add_text_field("contenido", TEXT),
-        autor: schema_builder.add_text_field("autor", TEXT | STORED),
         fecha: schema_builder.add_text_field("fecha", STRING | STORED),
+        subtitulo: schema_builder.add_text_field("subtitulo", STRING | STORED),
+        info_title: schema_builder.add_text_field("info_title", STRING | STORED)
+
+
     };
 
     let schema = schema_builder.build();
+
+    if Path::new("./search_index").exists() {
+        std::fs::remove_dir_all("./search_index")?;
+    } 
 
     let index = Index::create_in_dir("./search_index", schema)?;
 
     let mut index_writer = index.writer(50_000_000)?;
 
 
-    //all indexers needed
+    //all indexers needed for each tipo of document
     index_noticias(&pool, &mut index_writer, fields).await?;
     index_infodocs(&pool, &mut index_writer, fields).await?;
 
@@ -87,8 +100,10 @@ pub async fn index_infodocs(
         index_writer.add_document(doc!(
             fields.id => info_doc.id,
             fields.tipo => "info_doc",
-            fields.titulo => info_doc.titulo,
-            fields.contenido => info_doc.contenido
+            fields.titulo => info_doc.created_at,
+            fields.contenido => info_doc.contenido,
+            fields.info_title => info_doc.info_title,
+            fields.subtitulo => info_doc.subtitle
         ))?;
     }
 
@@ -115,8 +130,9 @@ pub async fn index_noticias(
             fields.tipo => "InfoDoc",
             fields.titulo => noticia.titulo,
             fields.contenido => noticia.contenido,
-            fields.autor => noticia.autor.unwrap_or_default(),
-            fields.fecha => noticia.fecha.unwrap_or_default(),
+            fields.fecha => noticia.fecha,
+            fields.subtitulo => noticia.subtitulo
+
         ))?;
     }
 

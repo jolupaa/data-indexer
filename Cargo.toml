@@ -9,3 +9,5 @@ anyhow = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "macros"] }
 tantivy = "0.24"
 dotenvy = "0.15.7"
+axum = "0.8.9"
+arc = "0.0.1"
