@@ -91,7 +91,7 @@ pub async fn index_noticias(
             id::text AS id,
             COALESCE(titulo, '') AS titulo,
             COALESCE(subtitulo, '') AS subtitulo,
-            COALESCE(contenido, '') AS contenido,
+            COALESCE(extracted_text, '') AS contenido,
             fecha::text AS fecha
         FROM noticias
         "#
@@ -127,7 +127,7 @@ pub async fn index_infodocs(
             id::text AS id,
             COALESCE(infotitle, '') AS info_title,
             COALESCE(title, '') AS title,
-            COALESCE(contenido, '') AS contenido,
+            COALESCE(extracted_text, '') AS contenido,
             COALESCE(subtitle, '') AS subtitle,
             created_at::text AS created_at
         FROM infoTabs
