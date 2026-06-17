@@ -1,11 +1,8 @@
 use anyhow::Result;
-mod lib;
-
+mod utils;
 mod indexer;
-use indexer::*;
 
 mod searcher;
-use searcher::*;
 
 mod init;
 use init::*;

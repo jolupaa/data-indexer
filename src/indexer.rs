@@ -14,7 +14,7 @@ use tantivy::{
 
 use crate::init::SearchFields;
 
-use crate::lib::*;
+use crate::utils::*;
 
 #[derive(Clone)]
 pub struct AppState {

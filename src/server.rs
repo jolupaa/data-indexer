@@ -19,7 +19,7 @@ use crate::indexer::{
 };
 
 use crate::searcher::search_documents;
-use crate::init::{reindex, SearchFields};
+use crate::init::{SearchFields};
 
 pub async fn start_server() -> Result<()> {
 

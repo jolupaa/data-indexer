@@ -7,7 +7,7 @@ use tantivy::{
     Index,
 };
 
-use crate::lib::*;
+use crate::utils::*;
 
 
 #[derive(sqlx::FromRow)]
