@@ -7,10 +7,7 @@ use axum::{
 
 use std::sync::{Arc, Mutex};
 
-use tantivy::{
-    schema::{Schema, STRING, STORED, TEXT},
-    Index,
-};
+use tantivy::Index;
 
 use crate::indexer::{
     AppState,
@@ -19,26 +16,16 @@ use crate::indexer::{
 };
 
 use crate::searcher::search_documents;
-use crate::init::{SearchFields};
+use crate::init::{build_schema, register_tokenizers};
 
 pub async fn start_server() -> Result<()> {
 
-    let mut schema_builder = Schema::builder();
-
-    let fields = SearchFields {
-        id: schema_builder.add_text_field("id", STRING | STORED),
-        uid: schema_builder.add_text_field("uid", STRING | STORED),
-        tipo: schema_builder.add_text_field("tipo", STRING | STORED),
-        info_title: schema_builder.add_text_field("info_title", TEXT | STORED),
-        titulo: schema_builder.add_text_field("titulo", TEXT | STORED),
-        subtitulo: schema_builder.add_text_field("subtitulo", TEXT | STORED),
-        contenido: schema_builder.add_text_field("contenido", TEXT),
-        fecha: schema_builder.add_text_field("fecha", STRING | STORED),
-    };
-
-    let _schema = schema_builder.build();
+    // El esquema en disco es el que manda; sólo necesitamos los `Field` handles,
+    // que `build_schema` reconstruye en el mismo orden que usó `reindex`.
+    let (_schema, fields) = build_schema();
 
     let index = Index::open_in_dir("./search_index")?;
+    register_tokenizers(&index);
 
     let index_writer = index.writer(50_000_000)?;
 

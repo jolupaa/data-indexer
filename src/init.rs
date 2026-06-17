@@ -3,9 +3,22 @@ use sqlx::PgPool;
 use std::path::Path;
 use tantivy::{
     doc,
-    schema::{Field, Schema, STRING, STORED, TEXT},
+    schema::{
+        Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING,
+    },
+    tokenizer::{
+        AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+    },
     Index,
 };
+
+use crate::spanish_plural::SpanishPluralFilter;
+
+/// Nombre del tokenizer que pliega acentos (á→a, ñ→n, …) además de pasar a
+/// minúsculas. Se aplica a los campos de texto buscables para que "actualizacion"
+/// encuentre "actualización". Debe registrarse en cada Index que se abra (tanto
+/// al reindexar como al servir) con `register_tokenizers`.
+pub const ES_TOKENIZER: &str = "es_folding";
 
 use crate::utils::*;
 
@@ -41,26 +54,60 @@ pub struct SearchFields {
     pub fecha: Field,
 }
 
-pub async fn reindex() -> Result<()> {
-    let database_url = std::env::var("DB_URL")
-        .expect("Variable DB_URL no encontrada");
+/// Opciones de un campo de texto buscable con el tokenizer que pliega acentos.
+/// `stored` controla si el valor original se devuelve en los resultados.
+fn folded_text(stored: bool) -> TextOptions {
+    let indexing = TextFieldIndexing::default()
+        .set_tokenizer(ES_TOKENIZER)
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+    let opts = TextOptions::default().set_indexing_options(indexing);
+    if stored {
+        opts.set_stored()
+    } else {
+        opts
+    }
+}
 
-    let pool = PgPool::connect(database_url.as_str()).await?;
-
+/// Construye el esquema del índice y devuelve los handles de cada campo.
+/// Es la única fuente de verdad del esquema: la usan tanto `reindex` (al crear
+/// el índice) como el servidor (para reconstruir los `Field` en el mismo orden).
+pub fn build_schema() -> (Schema, SearchFields) {
     let mut schema_builder = Schema::builder();
 
     let fields = SearchFields {
         id: schema_builder.add_text_field("id", STRING | STORED),
         uid: schema_builder.add_text_field("uid", STRING | STORED),
         tipo: schema_builder.add_text_field("tipo", STRING | STORED),
-        info_title: schema_builder.add_text_field("info_title", TEXT | STORED),
-        titulo: schema_builder.add_text_field("titulo", TEXT | STORED),
-        subtitulo: schema_builder.add_text_field("subtitulo", TEXT | STORED),
-        contenido: schema_builder.add_text_field("contenido", TEXT),
+        info_title: schema_builder.add_text_field("info_title", folded_text(true)),
+        titulo: schema_builder.add_text_field("titulo", folded_text(true)),
+        subtitulo: schema_builder.add_text_field("subtitulo", folded_text(true)),
+        contenido: schema_builder.add_text_field("contenido", folded_text(false)),
         fecha: schema_builder.add_text_field("fecha", STRING | STORED),
     };
 
-    let schema = schema_builder.build();
+    (schema_builder.build(), fields)
+}
+
+/// Registra el tokenizer `es_folding` en el Index. Hay que llamarlo en cada
+/// Index recién creado o abierto, porque el analizador (a diferencia de su
+/// nombre, que sí queda en el esquema) vive sólo en memoria.
+pub fn register_tokenizers(index: &Index) {
+    let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(AsciiFoldingFilter)
+        .filter(SpanishPluralFilter)
+        .build();
+    index.tokenizers().register(ES_TOKENIZER, analyzer);
+}
+
+pub async fn reindex() -> Result<()> {
+    let database_url = std::env::var("DB_URL")
+        .expect("Variable DB_URL no encontrada");
+
+    let pool = PgPool::connect(database_url.as_str()).await?;
+
+    let (schema, fields) = build_schema();
 
     if Path::new("./search_index").exists() {
         std::fs::remove_dir_all("./search_index")?;
@@ -69,6 +116,7 @@ pub async fn reindex() -> Result<()> {
     std::fs::create_dir_all("./search_index")?;
 
     let index = Index::create_in_dir("./search_index", schema)?;
+    register_tokenizers(&index);
 
     let mut index_writer = index.writer(50_000_000)?;
 

@@ -374,6 +374,7 @@ dependencies = [
  "sqlx",
  "tantivy",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]

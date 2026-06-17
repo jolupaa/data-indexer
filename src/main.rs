@@ -1,5 +1,6 @@
 use anyhow::Result;
 mod utils;
+mod spanish_plural;
 mod indexer;
 
 mod searcher;

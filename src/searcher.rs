@@ -23,6 +23,19 @@ use tantivy::{
     Document
 };
 
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+
+/// Normaliza el texto de la petición igual que el índice: a minúsculas y sin
+/// tildes/diacríticos. Descompone en NFD (á → a + ´) y descarta las marcas
+/// combinantes, dejando sólo el carácter base. Así "Actualización",
+/// "actualizacion" y "ACTUALIZACIÓN" buscan exactamente lo mismo.
+fn normalize_query(q: &str) -> String {
+    q.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .collect::<String>()
+        .to_lowercase()
+}
+
 #[derive(Deserialize)]
 pub struct SearchParams {
     pub q: String,
@@ -56,8 +69,10 @@ pub async fn search_documents(
         ],
     );
 
+    let normalized_q = normalize_query(&params.q);
+
     let text_query = query_parser
-        .parse_query(&params.q)
+        .parse_query(&normalized_q)
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
     let final_query: Box<dyn TantivyQuery> = match params.tipo.as_deref() {
