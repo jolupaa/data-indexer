@@ -1,11 +1,8 @@
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, query::QueryParser};
 
 use crate::error::ApiError;
-use crate::init::SearchFields;
-
-/// Memoria del `IndexWriter` del servidor.
-const WRITER_MEMORY_BYTES: usize = 50_000_000;
+use crate::init::{SearchFields, WRITER_MEMORY_BYTES};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,8 +18,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(index: Index, fields: SearchFields) -> tantivy::Result<Self> {
         let writer: IndexWriter = index.writer(WRITER_MEMORY_BYTES)?;
-        // Se recarga solo cuando cambia el índice (p. ej. al terminar una fusión
-        // de segmentos) y, además, a mano tras cada commit de la API.
+        // Se recarga solo cuando cambia el índice y, además, a mano tras cada
+        // commit de la API para que la respuesta ya sea visible. La recarga
+        // automática recoge las fusiones de segmentos (y libera los ficheros de
+        // los segmentos fusionados) aunque no lleguen más escrituras.
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -59,19 +58,81 @@ impl AppState {
     where
         F: FnOnce(&IndexWriter) -> tantivy::Result<()>,
     {
-        // Un pánico en otra petición no debe dejar el servidor sin escrituras
-        // para siempre: las operaciones del writer no quedan a medias.
-        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(poisoned) => {
+                // Otra petición entró en pánico con el writer en la mano y pudo
+                // dejar operaciones a medias (p. ej. el borrado de un upsert sin
+                // su alta): se descartan en vez de dejar que este commit las
+                // confirme, y el servidor sigue aceptando escrituras.
+                let mut writer = poisoned.into_inner();
+                rollback(&mut writer);
+                self.writer.clear_poison();
+                writer
+            }
+        };
 
         let result = ops(&writer).and_then(|()| writer.commit().map(|_| ()));
         if let Err(err) = result {
-            if let Err(rollback_err) = writer.rollback() {
-                eprintln!("Error al deshacer cambios pendientes: {rollback_err}");
-            }
+            rollback(&mut writer);
             return Err(err);
         }
         drop(writer);
 
-        self.reader.reload()
+        // El cambio ya está confirmado en disco: si la recarga falla no es un
+        // error de la escritura (la recarga automática lo recogerá enseguida).
+        if let Err(err) = self.reader.reload() {
+            eprintln!("Error al recargar el lector tras un commit: {err}");
+        }
+        Ok(())
+    }
+}
+
+fn rollback(writer: &mut IndexWriter) {
+    if let Err(err) = writer.rollback() {
+        eprintln!("Error al deshacer cambios pendientes: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init::{build_schema, register_tokenizers};
+    use tantivy::{Term, collector::Count, doc, query::AllQuery};
+
+    #[tokio::test]
+    async fn a_panic_mid_write_does_not_leak_half_applied_ops() {
+        let (schema, fields) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizers(&index);
+        let state = AppState::new(index, fields).unwrap();
+
+        state
+            .write(move |writer| {
+                writer.add_document(doc!(fields.uid => "noticia:1"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Un "upsert" que borra y revienta antes de añadir el documento nuevo.
+        let panicked = state
+            .write(move |writer| {
+                writer.delete_term(Term::from_field_text(fields.uid, "noticia:1"));
+                panic!("fallo a mitad de escritura");
+            })
+            .await;
+        assert!(panicked.is_err());
+
+        // La siguiente escritura funciona y no confirma el borrado huérfano.
+        state
+            .write(move |writer| {
+                writer.add_document(doc!(fields.uid => "noticia:2"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let searcher = state.reader.searcher();
+        assert_eq!(searcher.search(&AllQuery, &Count).unwrap(), 2);
     }
 }

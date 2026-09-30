@@ -12,19 +12,22 @@ use crate::searcher::search_documents;
 use crate::state::AppState;
 use crate::utils::*;
 
-/// Tamaño máximo del cuerpo de una petición. El de axum por defecto (2 MB) se
-/// queda corto para el texto extraído de documentos largos, que `reindex` sí
-/// indexa sin límite.
-pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Tamaño máximo del cuerpo de los upserts. El de axum por defecto (2 MB), que
+/// se mantiene en el resto de rutas, se queda corto para el texto extraído de
+/// documentos largos, que `reindex` sí indexa sin límite.
+pub const MAX_UPSERT_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
+    let upsert_limit = DefaultBodyLimit::max(MAX_UPSERT_BODY_BYTES);
     Router::new()
         .route("/health", get(health))
-        .route("/index/upsert", post(upsert_document))
-        .route("/index/upsert/batch", post(upsert_documents))
+        .route("/index/upsert", post(upsert_document).layer(upsert_limit))
+        .route(
+            "/index/upsert/batch",
+            post(upsert_documents).layer(upsert_limit),
+        )
         .route("/index/delete", delete(delete_document))
         .route("/search", get(search_documents))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 

@@ -280,6 +280,14 @@ async fn accepts_bodies_larger_than_axum_default() {
 }
 
 #[tokio::test]
+async fn only_upserts_accept_large_bodies() {
+    let app = test_app();
+    let big_delete = json!({"id": "x".repeat(3_000_000), "tipo": "noticia"});
+    let (status, _) = send(&app, Method::DELETE, "/index/delete", Some(big_delete)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn health_reports_document_count() {
     let app = test_app();
     upsert(&app, noticia("1", "uno")).await;

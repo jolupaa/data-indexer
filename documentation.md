@@ -86,6 +86,8 @@ cargo run --release -- serve
   index and corrupt it. Stop `serve`, run `reindex`, start `serve` again.
 - It refuses to use a directory that is not empty and does not look like an
   index (no `meta.json`), so a mistyped `INDEX_DIR` can't clobber other data.
+  If the existing index can't be opened (e.g. it is damaged), it stops without
+  touching it; delete the directory yourself and run `reindex` again.
 - `NULL` columns are indexed as empty strings.
 
 #### Upgrading
@@ -195,7 +197,7 @@ repeatedly with the same `tipo`+`id` is safe (idempotent upsert).
 sending.) Upserting always replaces the whole document, so send every field you
 want to keep — including `info_title` for `info_doc` documents.
 
-The request body may be up to 64 MB.
+The request body may be up to 64 MB (the other routes keep the default 2 MB).
 
 **Response** — `200 OK`
 
@@ -516,8 +518,8 @@ app.listen(3000, () => console.log("Node backend on :3000"));
   `/index/upsert`.
 - **Errors are plain text.** Non-2xx responses return a text message body, so
   read with `await res.text()` when handling failures.
-- **Limits.** `limit` ≤ 1000, `offset` ≤ 10000, `q` ≤ 1000 characters, request
-  bodies ≤ 64 MB.
+- **Limits.** `limit` ≤ 1000, `offset` ≤ 10000, `q` ≤ 1000 characters, upsert
+  bodies ≤ 64 MB (2 MB for other requests).
 
 ---
 

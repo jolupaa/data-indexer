@@ -67,7 +67,10 @@ fn document_uid(tipo: &str, id: &str) -> Result<String, ApiError> {
     Ok(make_uid(tipo, id))
 }
 
-fn build_document(
+/// Valida la petición y construye el documento junto con el término de su
+/// `uid`. Es la única definición de la forma de un documento: la usan tanto la
+/// API como `reindex`.
+pub fn build_document(
     fields: &SearchFields,
     payload: IndexDocumentRequest,
 ) -> Result<(Term, TantivyDocument), ApiError> {

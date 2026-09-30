@@ -5,14 +5,14 @@ use std::path::Path;
 use tantivy::{
     Index, IndexWriter, TantivyError,
     directory::{Directory, INDEX_WRITER_LOCK, MmapDirectory},
-    doc,
 };
 
-use crate::init::{SearchFields, create_index_in, explain_lock_error, open_index};
+use crate::indexer::{IndexDocumentRequest, build_document};
+use crate::init::{
+    SearchFields, WRITER_MEMORY_BYTES, build_schema, create_index_in, explain_lock_error,
+    register_tokenizers,
+};
 use crate::utils::*;
-
-/// Memoria del `IndexWriter` durante la carga masiva.
-const WRITER_MEMORY_BYTES: usize = 50_000_000;
 
 #[derive(sqlx::FromRow)]
 struct Noticia {
@@ -47,11 +47,12 @@ pub async fn reindex() -> Result<()> {
     let database_url = std::env::var("DB_URL").context("variable DB_URL no encontrada")?;
     let dir = index_dir();
 
-    let (mut index_writer, fields) = open_for_rebuild(&dir)?;
-
+    // Primero la conexión: si la base de datos no responde, no se toca nada.
     let pool = PgPool::connect(&database_url)
         .await
         .context("no se pudo conectar a PostgreSQL")?;
+
+    let (mut index_writer, fields) = open_for_rebuild(&dir)?;
 
     let noticias = index_noticias(&pool, &index_writer, fields).await?;
     let info_docs = index_infodocs(&pool, &index_writer, fields).await?;
@@ -80,8 +81,9 @@ fn open_for_rebuild(dir: &Path) -> Result<(IndexWriter, SearchFields)> {
 /// directorio con contenido que no sea un índice, para no escribir en uno
 /// equivocado por un `INDEX_DIR` mal puesto.
 ///
-/// Un índice que no se puede abrir con el esquema actual (el de una versión
-/// anterior, o uno dañado) no sirve para nada: se vacía y se crea de nuevo.
+/// Un índice creado con otro esquema (el de una versión anterior) no sirve
+/// para esta versión: se vacía y se crea de nuevo. Cualquier otro error al
+/// abrirlo se devuelve sin tocar nada.
 fn prepare_index(dir: &Path) -> Result<(Index, SearchFields)> {
     if !dir.join("meta.json").is_file() {
         if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
@@ -95,16 +97,25 @@ fn prepare_index(dir: &Path) -> Result<(Index, SearchFields)> {
         return create_index_in(dir);
     }
 
-    match open_index(dir) {
-        Ok(opened) => Ok(opened),
-        Err(_) => {
-            println!(
-                "El índice de {} es de otra versión o está dañado: se crea de nuevo.",
-                dir.display()
-            );
-            recreate_index(dir)
-        }
+    let index = Index::open_in_dir(dir).with_context(|| {
+        format!(
+            "no se pudo abrir el índice en {} (si está dañado, borra el directorio \
+             y vuelve a ejecutar `reindex`)",
+            dir.display()
+        )
+    })?;
+    let (schema, fields) = build_schema();
+    if index.schema() == schema {
+        register_tokenizers(&index);
+        return Ok((index, fields));
     }
+
+    println!(
+        "El índice de {} es de una versión anterior: se crea de nuevo.",
+        dir.display()
+    );
+    drop(index);
+    recreate_index(dir)
 }
 
 /// Borra el índice de `dir` y crea uno vacío con el esquema actual, con el lock
@@ -133,6 +144,27 @@ fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
     create_index_in(dir)
 }
 
+/// Añade una fila al índice con la misma función que usa `/index/upsert`, para
+/// que el documento tenga la misma forma venga por donde venga. Las filas que
+/// no pasan la validación se omiten con un aviso.
+fn index_row(
+    index_writer: &IndexWriter,
+    fields: SearchFields,
+    request: IndexDocumentRequest,
+) -> Result<bool> {
+    let uid = make_uid(&request.tipo, &request.id);
+    match build_document(&fields, request) {
+        Ok((_, document)) => {
+            index_writer.add_document(document)?;
+            Ok(true)
+        }
+        Err(err) => {
+            eprintln!("Aviso: se omite {uid}: {err}");
+            Ok(false)
+        }
+    }
+}
+
 pub async fn index_noticias(
     pool: &PgPool,
     index_writer: &IndexWriter,
@@ -153,18 +185,18 @@ pub async fn index_noticias(
 
     let mut count = 0;
     while let Some(noticia) = rows.try_next().await.context("error leyendo noticias")? {
-        let uid = make_uid("noticia", noticia.id.as_str());
-
-        index_writer.add_document(doc!(
-            fields.id => noticia.id,
-            fields.uid => uid,
-            fields.tipo => "noticia",
-            fields.titulo => noticia.titulo,
-            fields.subtitulo => noticia.subtitulo,
-            fields.contenido => noticia.contenido,
-            fields.fecha => noticia.fecha,
-        ))?;
-        count += 1;
+        let request = IndexDocumentRequest {
+            id: noticia.id,
+            tipo: "noticia".to_string(),
+            titulo: noticia.titulo,
+            subtitulo: noticia.subtitulo,
+            contenido: noticia.contenido,
+            fecha: noticia.fecha,
+            info_title: String::new(),
+        };
+        if index_row(index_writer, fields, request)? {
+            count += 1;
+        }
     }
 
     Ok(count)
@@ -191,23 +223,18 @@ pub async fn index_infodocs(
 
     let mut count = 0;
     while let Some(info_doc) = rows.try_next().await.context("error leyendo infoTabs")? {
-        let uid = make_uid("info_doc", info_doc.id.as_str());
-
-        let mut document = doc!(
-            fields.id => info_doc.id,
-            fields.uid => uid,
-            fields.tipo => "info_doc",
-            fields.titulo => info_doc.title,
-            fields.subtitulo => info_doc.subtitle,
-            fields.contenido => info_doc.contenido,
-            fields.fecha => info_doc.created_at,
-        );
-        // Igual que en `/index/upsert`: sin `info_title` si está vacío.
-        if !info_doc.info_title.is_empty() {
-            document.add_text(fields.info_title, info_doc.info_title);
+        let request = IndexDocumentRequest {
+            id: info_doc.id,
+            tipo: "info_doc".to_string(),
+            titulo: info_doc.title,
+            subtitulo: info_doc.subtitle,
+            contenido: info_doc.contenido,
+            fecha: info_doc.created_at,
+            info_title: info_doc.info_title,
+        };
+        if index_row(index_writer, fields, request)? {
+            count += 1;
         }
-        index_writer.add_document(document)?;
-        count += 1;
     }
 
     Ok(count)
@@ -216,9 +243,10 @@ pub async fn index_infodocs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::init::open_index;
     use tantivy::{
-        Term, collector::Count, query::AllQuery, schema::STORED, schema::STRING, schema::Schema,
-        schema::TEXT,
+        Term, collector::Count, doc, query::AllQuery, schema::STORED, schema::STRING,
+        schema::Schema, schema::TEXT,
     };
 
     fn num_docs(dir: &Path) -> usize {
@@ -292,6 +320,23 @@ mod tests {
             tantivy::schema::IndexRecordOption::Basic,
         );
         assert_eq!(searcher.search(&nuevo, &Count).unwrap(), 1);
+    }
+
+    #[test]
+    fn does_not_wipe_an_index_it_cannot_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_index_in(tmp.path()).unwrap();
+        add_one(tmp.path(), "valioso");
+        let meta = tmp.path().join("meta.json");
+        let original = std::fs::read(&meta).unwrap();
+        std::fs::write(&meta, b"{ no es json").unwrap();
+        let files_before = std::fs::read_dir(tmp.path()).unwrap().count();
+
+        assert!(open_for_rebuild(tmp.path()).is_err());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), files_before);
+
+        std::fs::write(&meta, original).unwrap();
+        assert_eq!(num_docs(tmp.path()), 1);
     }
 
     #[test]

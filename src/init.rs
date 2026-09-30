@@ -21,6 +21,9 @@ use crate::spanish_plural::SpanishPluralFilter;
 /// coincidirían con los de las consultas) hasta que se ejecute `reindex`.
 pub const ES_TOKENIZER: &str = "es_folding_v2";
 
+/// Memoria del `IndexWriter`, tanto en `serve` como en `reindex`.
+pub const WRITER_MEMORY_BYTES: usize = 50_000_000;
+
 #[derive(Clone, Copy)]
 pub struct SearchFields {
     pub id: Field,
@@ -74,13 +77,18 @@ pub fn build_schema() -> (Schema, SearchFields) {
 /// Index recién creado o abierto, porque el analizador (a diferencia de su
 /// nombre, que sí queda en el esquema) vive sólo en memoria.
 pub fn register_tokenizers(index: &Index) {
-    let analyzer = TextAnalyzer::builder(NfcTokenizer::new(SimpleTokenizer::default()))
+    index.tokenizers().register(ES_TOKENIZER, es_analyzer());
+}
+
+/// El analizador de `ES_TOKENIZER`. Si cambia lo que produce, hay que subir la
+/// versión de `ES_TOKENIZER`.
+pub fn es_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(NfcTokenizer::new(SimpleTokenizer::default()))
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
         .filter(AsciiFoldingFilter)
         .filter(SpanishPluralFilter)
-        .build();
-    index.tokenizers().register(ES_TOKENIZER, analyzer);
+        .build()
 }
 
 /// Crea un índice vacío con el esquema actual y el analizador registrado.
