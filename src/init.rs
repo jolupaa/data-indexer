@@ -115,9 +115,22 @@ pub enum IndexStatus {
     Ready(Index, SearchFields),
 }
 
-/// Campos que han tenido todas las versiones de data-indexer. Un índice sin
-/// ellos es de otra aplicación y no se toca.
-const KEY_FIELDS: [&str; 3] = ["id", "tipo", "titulo"];
+/// Campos de los índices de cada versión de data-indexer: la primera y las que
+/// añadieron `uid`, `subtitulo` e `info_title` (la actual). Un índice con otros
+/// campos es de otra aplicación y no se toca.
+const KNOWN_FIELD_SETS: [&[&str]; 2] = [
+    &["id", "tipo", "titulo", "contenido", "autor", "fecha"],
+    &[
+        "id",
+        "uid",
+        "tipo",
+        "info_title",
+        "titulo",
+        "subtitulo",
+        "contenido",
+        "fecha",
+    ],
+];
 
 /// Examina el índice de `dir`. Los `Field` se reconstruyen con `build_schema`,
 /// así que un índice con otro esquema haría que cada valor acabase en el campo
@@ -141,13 +154,19 @@ pub fn inspect_index(dir: &Path) -> Result<IndexStatus> {
         .map_err(anyhow::Error::from)
         .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
         .with_context(damaged)?;
-    let field_names: Vec<&str> = meta["schema"]
+    let mut field_names: Vec<&str> = meta["schema"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|field| field["name"].as_str())
         .collect();
-    if KEY_FIELDS.iter().any(|name| !field_names.contains(name)) {
+    field_names.sort_unstable();
+    let is_ours = KNOWN_FIELD_SETS.iter().any(|known| {
+        let mut known = known.to_vec();
+        known.sort_unstable();
+        known == field_names
+    });
+    if !is_ours {
         bail!(
             "{} contiene un índice que no es de data-indexer; no se usará",
             dir.display()
@@ -226,15 +245,32 @@ pub(crate) mod tests {
 
     #[test]
     fn open_index_rejects_indexes_of_other_applications() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut builder = Schema::builder();
-        builder.add_text_field("body", TEXT | STORED);
-        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+        // También uno que comparte nombres de campo tan corrientes como estos.
+        for names in [&["body"][..], &["id", "tipo", "titulo", "cuerpo"]] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut builder = Schema::builder();
+            for name in names {
+                builder.add_text_field(name, TEXT | STORED);
+            }
+            Index::create_in_dir(tmp.path(), builder.build()).unwrap();
 
-        let Err(err) = open_index(tmp.path()) else {
-            panic!("no debería abrir el índice de otra aplicación");
-        };
-        assert!(err.to_string().contains("no es de data-indexer"), "{err}");
+            let Err(err) = open_index(tmp.path()) else {
+                panic!("no debería abrir el índice de otra aplicación: {names:?}");
+            };
+            assert!(err.to_string().contains("no es de data-indexer"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_current_schema_has_the_latest_known_fields() {
+        // Si se añade un campo, hay que añadir el conjunto actual a
+        // `KNOWN_FIELD_SETS` para que la siguiente versión lo reconozca.
+        let (schema, _) = build_schema();
+        let mut current: Vec<&str> = schema.fields().map(|(_, entry)| entry.name()).collect();
+        current.sort_unstable();
+        let mut latest = KNOWN_FIELD_SETS[KNOWN_FIELD_SETS.len() - 1].to_vec();
+        latest.sort_unstable();
+        assert_eq!(current, latest);
     }
 
     #[test]

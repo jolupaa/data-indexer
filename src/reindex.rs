@@ -126,7 +126,7 @@ fn ensure_only_index_files(dir: &Path) -> Result<()> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let is_ours = entry.file_type()?.is_file() && is_index_file(&name);
+        let is_ours = !entry.file_type()?.is_dir() && is_index_file(&name);
         if !is_ours && name != "lost+found" {
             bail!(
                 "{} contiene ficheros que no son de un índice (p. ej. {name}); no se usará",
@@ -191,7 +191,9 @@ fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if entry.file_type()?.is_file()
+        // Nunca directorios; un enlace simbólico sí (se borra el enlace, no
+        // aquello a lo que apunta).
+        if !entry.file_type()?.is_dir()
             && is_index_file(&name)
             && !name.starts_with(".tantivy-")
             && name != REBUILD_MARKER
@@ -484,6 +486,24 @@ mod tests {
             leftovers.iter().all(|name| live.contains(name)),
             "quedan segmentos del índice viejo: {leftovers:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recreates_an_old_index_whose_meta_json_is_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("search_index");
+        std::fs::create_dir(&dir).unwrap();
+        Index::create_in_dir(&dir, crate::init::tests::previous_version_schema()).unwrap();
+        let real_meta = root.path().join("meta-real.json");
+        std::fs::rename(dir.join("meta.json"), &real_meta).unwrap();
+        std::os::unix::fs::symlink(&real_meta, dir.join("meta.json")).unwrap();
+
+        let (writer, _) = open_for_rebuild(&dir).unwrap();
+        finish_rebuild(&dir, writer).unwrap();
+        open_index(&dir).unwrap();
+        // Se borró el enlace, no el fichero al que apuntaba.
+        assert!(real_meta.exists());
     }
 
     #[test]

@@ -57,10 +57,10 @@ impl AppState {
     }
 
     /// Descarta las operaciones pendientes del writer. Si el propio rollback
-    /// falla, tantivy deja ese writer inservible (sin su lock, y un segundo
-    /// rollback entraría en pánico): se sustituye en el acto por uno nuevo, que
-    /// recupera el lock del índice. Si tampoco se puede, se deja el hueco vacío
-    /// y la siguiente escritura lo vuelve a intentar.
+    /// falla, tantivy deja ese writer inservible (y suelta el lock del índice;
+    /// un segundo rollback entraría en pánico): se sustituye en el acto por uno
+    /// nuevo, que vuelve a tomar el lock. Si tampoco se puede, se deja el hueco
+    /// vacío y la siguiente escritura lo vuelve a intentar.
     fn discard_pending(&self, slot: &mut Option<IndexWriter>) {
         let Some(writer) = slot.as_mut() else {
             return;
