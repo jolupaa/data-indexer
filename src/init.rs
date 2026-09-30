@@ -115,36 +115,48 @@ pub enum IndexStatus {
     Ready(Index, SearchFields),
 }
 
+/// Campos que han tenido todas las versiones de data-indexer. Un índice sin
+/// ellos es de otra aplicación y no se toca.
+const KEY_FIELDS: [&str; 3] = ["id", "tipo", "titulo"];
+
 /// Examina el índice de `dir`. Los `Field` se reconstruyen con `build_schema`,
 /// así que un índice con otro esquema haría que cada valor acabase en el campo
 /// equivocado: por eso se distingue como `Outdated`.
 pub fn inspect_index(dir: &Path) -> Result<IndexStatus> {
-    if !dir.join("meta.json").is_file() {
+    let meta_path = dir.join("meta.json");
+    if !meta_path.is_file() {
         return Ok(IndexStatus::Missing);
     }
 
-    let index = Index::open_in_dir(dir).with_context(|| {
+    // Antes de abrirlo con tantivy (que puede fallar con índices de otras
+    // versiones de tantivy) se mira de quién es, leyendo su esquema a mano.
+    let damaged = || {
         format!(
-            "no se pudo abrir el índice en {} (si está dañado, vacía el directorio y \
-             ejecuta `reindex`)",
+            "no se pudo abrir el índice en {} (si es de data-indexer y está dañado, \
+             vacía el directorio y ejecuta `reindex`)",
             dir.display()
         )
-    })?;
+    };
+    let meta: serde_json::Value = std::fs::read(&meta_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
+        .with_context(damaged)?;
+    let field_names: Vec<&str> = meta["schema"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|field| field["name"].as_str())
+        .collect();
+    if KEY_FIELDS.iter().any(|name| !field_names.contains(name)) {
+        bail!(
+            "{} contiene un índice que no es de data-indexer; no se usará",
+            dir.display()
+        );
+    }
 
+    let index = Index::open_in_dir(dir).with_context(damaged)?;
     let (schema, fields) = build_schema();
     if index.schema() != schema {
-        // Sólo se da por una versión anterior de este índice si tiene sus
-        // campos clave; si no, es de otra aplicación y no hay que tocarlo.
-        let current = index.schema();
-        if ["id", "uid", "tipo", "titulo"]
-            .iter()
-            .any(|name| current.get_field(name).is_err())
-        {
-            bail!(
-                "{} contiene un índice que no es de data-indexer; no se usará",
-                dir.display()
-            );
-        }
         return Ok(IndexStatus::Outdated);
     }
 
@@ -192,6 +204,25 @@ pub fn explain_lock_error(err: TantivyError, dir: &Path) -> anyhow::Error {
 pub(crate) mod tests {
     use super::*;
     use tantivy::schema::TEXT;
+
+    #[test]
+    fn indexes_from_the_first_release_count_as_outdated() {
+        // La primera versión no tenía `uid` ni `subtitulo`, pero sí es nuestra.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("tipo", STRING | STORED);
+        builder.add_text_field("titulo", TEXT | STORED);
+        builder.add_text_field("contenido", TEXT);
+        builder.add_text_field("autor", TEXT | STORED);
+        builder.add_text_field("fecha", STRING | STORED);
+        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+
+        assert!(matches!(
+            inspect_index(tmp.path()).unwrap(),
+            IndexStatus::Outdated
+        ));
+    }
 
     #[test]
     fn open_index_rejects_indexes_of_other_applications() {

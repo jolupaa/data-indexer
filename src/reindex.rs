@@ -123,9 +123,11 @@ fn ensure_only_index_files(dir: &Path) -> Result<()> {
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
+        let entry = entry?;
+        let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_index_file(&name) && name != "lost+found" {
+        let is_ours = entry.file_type()?.is_file() && is_index_file(&name);
+        if !is_ours && name != "lost+found" {
             bail!(
                 "{} contiene ficheros que no son de un índice (p. ej. {name}); no se usará",
                 dir.display()
@@ -141,10 +143,16 @@ fn is_index_file(name: &str) -> bool {
         || name == "meta.json"
         || name == ".managed.json"
         || name.starts_with(".tantivy-")
-        // Temporales de las escrituras atómicas de tantivy (p. ej. de meta.json)
-        // que quedan si el proceso muere a mitad.
-        || name.starts_with(".tmp")
+        || is_atomic_write_leftover(name)
         || name == REBUILD_MARKER
+}
+
+/// Temporal de las escrituras atómicas de tantivy (p. ej. de `meta.json`), que
+/// queda si el proceso muere a mitad: ".tmp" más 6 caracteres alfanuméricos.
+fn is_atomic_write_leftover(name: &str) -> bool {
+    name.len() == 10
+        && name.starts_with(".tmp")
+        && name[4..].bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// "<uuid en 32 hex>.<componente>", con los componentes que usa tantivy. Mirar
@@ -178,13 +186,19 @@ fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
     std::fs::write(dir.join(REBUILD_MARKER), b"")
         .context("no se pudo crear la marca de reconstrucción incompleta")?;
 
-    let mut stale: Vec<_> = std::fs::read_dir(dir)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<_>>()?;
-    stale.retain(|path| {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        is_index_file(&name) && !name.starts_with(".tantivy-") && name != REBUILD_MARKER
-    });
+    let mut stale = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type()?.is_file()
+            && is_index_file(&name)
+            && !name.starts_with(".tantivy-")
+            && name != REBUILD_MARKER
+        {
+            stale.push(entry.path());
+        }
+    }
     // `meta.json` el último: si algo falla antes, sigue siendo un índice
     // (viejo) que el siguiente `reindex` reconocerá y volverá a sustituir.
     stale.sort_by_key(|path| path.ends_with("meta.json"));
@@ -478,6 +492,9 @@ mod tests {
         assert!(is_index_file(".managed.json"));
         assert!(is_index_file(".tantivy-writer.lock"));
         assert!(is_index_file(".tmpAbC123"));
+        assert!(!is_index_file(".tmp"));
+        assert!(!is_index_file(".tmp_cache"));
+        assert!(!is_index_file(".tmp.driveupload"));
         assert!(is_index_file("0123456789abcdef0123456789abcdef.idx"));
         assert!(is_index_file("0123456789abcdef0123456789abcdef.store.temp"));
         assert!(is_index_file("0123456789abcdef0123456789abcdef.12.del"));

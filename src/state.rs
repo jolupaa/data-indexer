@@ -58,14 +58,21 @@ impl AppState {
 
     /// Descarta las operaciones pendientes del writer. Si el propio rollback
     /// falla, tantivy deja ese writer inservible (sin su lock, y un segundo
-    /// rollback entraría en pánico): se tira y la siguiente escritura crea otro.
-    fn discard_pending(slot: &mut Option<IndexWriter>) {
+    /// rollback entraría en pánico): se sustituye en el acto por uno nuevo, que
+    /// recupera el lock del índice. Si tampoco se puede, se deja el hueco vacío
+    /// y la siguiente escritura lo vuelve a intentar.
+    fn discard_pending(&self, slot: &mut Option<IndexWriter>) {
         let Some(writer) = slot.as_mut() else {
             return;
         };
-        if let Err(err) = writer.rollback() {
-            eprintln!("Error al deshacer cambios pendientes; se descarta el writer: {err}");
-            *slot = None;
+        let Err(err) = writer.rollback() else {
+            return;
+        };
+        eprintln!("Error al deshacer cambios pendientes; se sustituye el writer: {err}");
+        *slot = None;
+        match self.index.writer(WRITER_MEMORY_BYTES) {
+            Ok(fresh) => *slot = Some(fresh),
+            Err(err) => eprintln!("No se pudo recrear el writer del índice: {err}"),
         }
     }
 
@@ -81,7 +88,7 @@ impl AppState {
                 // su alta): se descartan en vez de dejar que este commit las
                 // confirme, y el servidor sigue aceptando escrituras.
                 let mut slot = poisoned.into_inner();
-                Self::discard_pending(&mut slot);
+                self.discard_pending(&mut slot);
                 self.writer.clear_poison();
                 slot
             }
@@ -93,7 +100,7 @@ impl AppState {
         };
         let result = ops(writer).and_then(|()| writer.commit().map(|_| ()));
         if let Err(err) = result {
-            Self::discard_pending(&mut slot);
+            self.discard_pending(&mut slot);
             return Err(err);
         }
         drop(slot);
