@@ -79,15 +79,19 @@ fn open_for_rebuild(dir: &Path) -> Result<(IndexWriter, SearchFields)> {
 /// cero (ver `REBUILD_MARKER`).
 fn finish_rebuild(dir: &Path, mut index_writer: IndexWriter) -> Result<()> {
     index_writer.commit()?;
-    // Deja terminadas las fusiones de segmentos antes de salir del proceso.
-    index_writer.wait_merging_threads()?;
 
+    // Con el commit hecho, el índice ya está completo aunque lo que sigue
+    // (esperar a las fusiones) falle o se interrumpa.
     match std::fs::remove_file(dir.join(REBUILD_MARKER)) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-            Err(err).context("no se pudo borrar la marca de reconstrucción incompleta")
+            return Err(err).context("no se pudo borrar la marca de reconstrucción incompleta");
         }
-        _ => Ok(()),
+        _ => {}
     }
+
+    // Deja terminadas las fusiones de segmentos antes de salir del proceso.
+    index_writer.wait_merging_threads()?;
+    Ok(())
 }
 
 /// Abre el índice de `dir` o lo crea si no hay ninguno. Un índice de una versión
@@ -133,15 +137,30 @@ fn ensure_only_index_files(dir: &Path) -> Result<()> {
 
 /// Ficheros que crea tantivy (o `reindex`) en el directorio del índice.
 fn is_index_file(name: &str) -> bool {
-    // Segmentos: "<uuid en 32 hex>.<extensión>" y "<uuid>.<opstamp>.del".
-    let is_segment_file = name.len() > 33
-        && name.as_bytes()[32] == b'.'
-        && name[..32].bytes().all(|b| b.is_ascii_hexdigit());
-    is_segment_file
+    is_segment_file(name)
         || name == "meta.json"
         || name == ".managed.json"
         || name.starts_with(".tantivy-")
+        // Temporales de las escrituras atómicas de tantivy (p. ej. de meta.json)
+        // que quedan si el proceso muere a mitad.
+        || name.starts_with(".tmp")
         || name == REBUILD_MARKER
+}
+
+/// "<uuid en 32 hex>.<componente>", con los componentes que usa tantivy. Mirar
+/// sólo el uuid confundiría con segmentos cualquier fichero nombrado por su
+/// hash MD5 (p. ej. "d41d8cd98f00b204e9800998ecf8427e.jpg").
+fn is_segment_file(name: &str) -> bool {
+    let Some((uuid, component)) = name.split_once('.') else {
+        return false;
+    };
+    let is_opstamp = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    uuid.len() == 32
+        && uuid.bytes().all(|b| b.is_ascii_hexdigit())
+        && (matches!(
+            component,
+            "idx" | "pos" | "term" | "store" | "store.temp" | "fast" | "fieldnorm"
+        ) || component.strip_suffix(".del").is_some_and(is_opstamp))
 }
 
 /// Borra el índice de `dir` (sólo sus ficheros: `lost+found` o cualquier otra
@@ -192,9 +211,22 @@ fn index_row(
             Ok(true)
         }
         Err(err) => {
-            eprintln!("Aviso: se omite {}:{}: {err}", request.tipo, request.id);
+            eprintln!(
+                "Aviso: se omite {}:{}: {err}",
+                preview(&request.tipo),
+                preview(&request.id)
+            );
             Ok(false)
         }
+    }
+}
+
+/// Los primeros caracteres de `text`, para no volcar al log un id de megas.
+fn preview(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    match text.char_indices().nth(MAX_CHARS) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
     }
 }
 
@@ -278,8 +310,7 @@ mod tests {
     use super::*;
     use crate::init::open_index;
     use tantivy::{
-        Term, collector::Count, doc, query::AllQuery, schema::STORED, schema::STRING,
-        schema::Schema, schema::TEXT,
+        Term, collector::Count, doc, query::AllQuery, schema::STORED, schema::Schema, schema::TEXT,
     };
 
     fn num_docs(dir: &Path) -> usize {
@@ -396,10 +427,11 @@ mod tests {
     #[test]
     fn recreates_an_index_from_an_older_version() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut builder = Schema::builder();
-        let id = builder.add_text_field("id", STRING | STORED);
-        builder.add_text_field("titulo", TEXT | STORED);
-        let old = Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+        let schema = crate::init::tests::previous_version_schema();
+        let id = schema.get_field("id").unwrap();
+        let old = Index::create_in_dir(tmp.path(), schema).unwrap();
+        old.tokenizers()
+            .register("es_folding", crate::init::es_analyzer());
         let mut old_writer: IndexWriter = old.writer(15_000_000).unwrap();
         old_writer.add_document(doc!(id => "viejo")).unwrap();
         old_writer.commit().unwrap();
@@ -445,10 +477,38 @@ mod tests {
         assert!(is_index_file("meta.json"));
         assert!(is_index_file(".managed.json"));
         assert!(is_index_file(".tantivy-writer.lock"));
+        assert!(is_index_file(".tmpAbC123"));
         assert!(is_index_file("0123456789abcdef0123456789abcdef.idx"));
+        assert!(is_index_file("0123456789abcdef0123456789abcdef.store.temp"));
         assert!(is_index_file("0123456789abcdef0123456789abcdef.12.del"));
         assert!(!is_index_file("lost+found"));
         assert!(!is_index_file("notas.txt"));
         assert!(!is_index_file("0123456789abcdef0123456789abcdeg.idx"));
+        // Ficheros nombrados por su hash MD5: no son nuestros.
+        assert!(!is_index_file("d41d8cd98f00b204e9800998ecf8427e.jpg"));
+        assert!(!is_index_file("d41d8cd98f00b204e9800998ecf8427e.del"));
+        assert!(!is_index_file("d41d8cd98f00b204e9800998ecf8427e.x.del"));
+    }
+
+    #[test]
+    fn refuses_a_tantivy_index_from_another_application() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field("body", TEXT | STORED);
+        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+        let files_before = std::fs::read_dir(tmp.path()).unwrap().count();
+
+        let Err(err) = open_for_rebuild(tmp.path()) else {
+            panic!("no debería tocar el índice de otra aplicación");
+        };
+        assert!(err.to_string().contains("no es de data-indexer"), "{err}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), files_before);
+    }
+
+    #[test]
+    fn previews_long_values() {
+        assert_eq!(preview("123"), "123");
+        let long = "é".repeat(1000);
+        assert_eq!(preview(&long).chars().count(), 81);
     }
 }

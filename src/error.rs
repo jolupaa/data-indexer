@@ -29,10 +29,11 @@ impl ApiError {
         }
     }
 
-    /// Indica a qué elemento de un lote se refiere el error.
+    /// Indica a qué elemento de un lote se refiere el error, con su índice en
+    /// el array (desde 0), como en JSON: "[17]: …".
     pub fn for_item(self, index: usize) -> Self {
         Self {
-            message: format!("documento {index}: {}", self.message),
+            message: format!("[{index}]: {}", self.message),
             ..self
         }
     }

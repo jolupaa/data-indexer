@@ -86,8 +86,9 @@ cargo run --release -- serve
   index write lock). A running server would keep writing into the replaced
   index and corrupt it. Stop `serve`, run `reindex`, start `serve` again.
 - It refuses to use a directory that has no index (`meta.json`) but contains
-  other files, so a mistyped `INDEX_DIR` can't clobber other data. It only ever
-  deletes Tantivy's own files.
+  other files, or that holds another application's Tantivy index, so a
+  mistyped `INDEX_DIR` can't clobber other data. It only ever deletes Tantivy's
+  own files.
 - If the existing index can't be opened (e.g. it is damaged), it stops without
   touching it; empty the directory yourself and run `reindex` again.
 - When it has to create the index from scratch (first run, or after an
@@ -222,8 +223,8 @@ The request body may be up to 64 MB (the other routes keep the default 2 MB).
 Same as `/index/upsert` but takes a JSON **array** of documents and applies them
 all in a single commit, which is much cheaper than one request per document.
 It is all-or-nothing: if any document is invalid, nothing is written and the
-`400` message starts with its position in the array (`documento 17: …`). If
-the same `tipo`+`id` appears more than once, the last one wins.
+`400` message starts with its 0-based index in the array (`[17]: …`). If the
+same `tipo`+`id` appears more than once, the last one wins.
 
 **Response** — `200 OK`
 

@@ -10,7 +10,9 @@ pub struct AppState {
     /// Lector compartido por todas las búsquedas. Crear uno por petición
     /// obliga a reabrir todos los segmentos cada vez.
     pub reader: IndexReader,
-    pub writer: Arc<Mutex<IndexWriter>>,
+    /// `None` si el writer quedó inservible: se crea otro en la siguiente
+    /// escritura (ver `discard_pending`).
+    pub writer: Arc<Mutex<Option<IndexWriter>>>,
     pub query_parser: Arc<QueryParser>,
     pub fields: SearchFields,
 }
@@ -31,7 +33,7 @@ impl AppState {
         Ok(Self {
             index,
             reader,
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(Some(writer))),
             query_parser: Arc::new(query_parser),
             fields,
         })
@@ -56,15 +58,14 @@ impl AppState {
 
     /// Descarta las operaciones pendientes del writer. Si el propio rollback
     /// falla, tantivy deja ese writer inservible (sin su lock, y un segundo
-    /// rollback entraría en pánico), así que se sustituye por uno nuevo.
-    fn discard_pending(&self, writer: &mut IndexWriter) {
-        let Err(err) = writer.rollback() else {
+    /// rollback entraría en pánico): se tira y la siguiente escritura crea otro.
+    fn discard_pending(slot: &mut Option<IndexWriter>) {
+        let Some(writer) = slot.as_mut() else {
             return;
         };
-        eprintln!("Error al deshacer cambios pendientes: {err}");
-        match self.index.writer(WRITER_MEMORY_BYTES) {
-            Ok(fresh) => *writer = fresh,
-            Err(err) => eprintln!("No se pudo recrear el writer del índice: {err}"),
+        if let Err(err) = writer.rollback() {
+            eprintln!("Error al deshacer cambios pendientes; se descarta el writer: {err}");
+            *slot = None;
         }
     }
 
@@ -72,26 +73,30 @@ impl AppState {
     where
         F: FnOnce(&IndexWriter) -> tantivy::Result<()>,
     {
-        let mut writer = match self.writer.lock() {
-            Ok(writer) => writer,
+        let mut slot = match self.writer.lock() {
+            Ok(slot) => slot,
             Err(poisoned) => {
                 // Otra petición entró en pánico con el writer en la mano y pudo
                 // dejar operaciones a medias (p. ej. el borrado de un upsert sin
                 // su alta): se descartan en vez de dejar que este commit las
                 // confirme, y el servidor sigue aceptando escrituras.
-                let mut writer = poisoned.into_inner();
-                self.discard_pending(&mut writer);
+                let mut slot = poisoned.into_inner();
+                Self::discard_pending(&mut slot);
                 self.writer.clear_poison();
-                writer
+                slot
             }
         };
 
-        let result = ops(&writer).and_then(|()| writer.commit().map(|_| ()));
+        let writer = match slot.as_mut() {
+            Some(writer) => writer,
+            None => slot.insert(self.index.writer(WRITER_MEMORY_BYTES)?),
+        };
+        let result = ops(writer).and_then(|()| writer.commit().map(|_| ()));
         if let Err(err) = result {
-            self.discard_pending(&mut writer);
+            Self::discard_pending(&mut slot);
             return Err(err);
         }
-        drop(writer);
+        drop(slot);
 
         // El cambio ya está confirmado en disco: si la recarga falla no es un
         // error de la escritura (la recarga automática lo recogerá enseguida).
@@ -142,5 +147,29 @@ mod tests {
             .unwrap();
         let searcher = state.reader.searcher();
         assert_eq!(searcher.search(&AllQuery, &Count).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_discarded_writer_is_replaced_on_the_next_write() {
+        let (schema, fields) = build_schema();
+        let index = Index::create_in_ram(schema);
+        register_tokenizers(&index);
+        let state = AppState::new(index, fields).unwrap();
+
+        // Lo que hace `discard_pending` cuando el rollback falla.
+        *state.writer.lock().unwrap() = None;
+
+        state
+            .write(move |writer| {
+                writer.add_document(doc!(fields.uid => "noticia:1"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state.reader.searcher().search(&AllQuery, &Count).unwrap(),
+            1
+        );
+        assert!(state.writer.lock().unwrap().is_some());
     }
 }

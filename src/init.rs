@@ -133,6 +133,18 @@ pub fn inspect_index(dir: &Path) -> Result<IndexStatus> {
 
     let (schema, fields) = build_schema();
     if index.schema() != schema {
+        // Sólo se da por una versión anterior de este índice si tiene sus
+        // campos clave; si no, es de otra aplicación y no hay que tocarlo.
+        let current = index.schema();
+        if ["id", "uid", "tipo", "titulo"]
+            .iter()
+            .any(|name| current.get_field(name).is_err())
+        {
+            bail!(
+                "{} contiene un índice que no es de data-indexer; no se usará",
+                dir.display()
+            );
+        }
         return Ok(IndexStatus::Outdated);
     }
 
@@ -177,9 +189,22 @@ pub fn explain_lock_error(err: TantivyError, dir: &Path) -> anyhow::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tantivy::schema::TEXT;
+
+    #[test]
+    fn open_index_rejects_indexes_of_other_applications() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field("body", TEXT | STORED);
+        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+
+        let Err(err) = open_index(tmp.path()) else {
+            panic!("no debería abrir el índice de otra aplicación");
+        };
+        assert!(err.to_string().contains("no es de data-indexer"), "{err}");
+    }
 
     #[test]
     fn open_index_requires_an_existing_index() {
@@ -190,15 +215,34 @@ mod tests {
         assert!(err.to_string().contains("reindex"), "{err}");
     }
 
+    /// El esquema de la primera versión: mismos campos, pero con el tokenizer
+    /// `es_folding`, anterior a la corrección de plurales y de NFC.
+    pub fn previous_version_schema() -> Schema {
+        let text = |stored: bool| {
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer("es_folding")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let opts = TextOptions::default().set_indexing_options(indexing);
+            if stored { opts.set_stored() } else { opts }
+        };
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("uid", STRING | STORED);
+        builder.add_text_field("tipo", STRING | STORED);
+        builder.add_text_field("info_title", text(true));
+        builder.add_text_field("titulo", text(true));
+        builder.add_text_field("subtitulo", text(true));
+        builder.add_text_field("contenido", text(false));
+        builder.add_text_field("fecha", STRING | STORED);
+        builder.build()
+    }
+
     #[test]
     fn open_index_rejects_indexes_built_with_another_schema() {
         // Un índice de una versión anterior (otro analizador en los campos de
         // texto) tendría términos que ya no coinciden con los de las consultas.
         let tmp = tempfile::tempdir().unwrap();
-        let mut builder = Schema::builder();
-        builder.add_text_field("id", STRING | STORED);
-        builder.add_text_field("titulo", TEXT | STORED);
-        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+        Index::create_in_dir(tmp.path(), previous_version_schema()).unwrap();
 
         let Err(err) = open_index(tmp.path()) else {
             panic!("no debería abrir un índice con otro esquema");

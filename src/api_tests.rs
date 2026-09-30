@@ -267,7 +267,7 @@ async fn batch_upsert_indexes_everything_in_one_commit() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.starts_with("documento 1:"), "{body}");
+    assert!(body.starts_with("[1]: "), "{body}");
     assert!(search(&app, "q=nuevo").await.is_empty());
 }
 
