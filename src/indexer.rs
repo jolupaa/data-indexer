@@ -48,7 +48,7 @@ pub struct BatchResponse {
 const MAX_KEY_BYTES: usize = 1024;
 
 /// Valida el par (`tipo`, `id`) y devuelve su `uid`.
-fn document_uid(tipo: &str, id: &str) -> Result<String, ApiError> {
+pub fn document_uid(tipo: &str, id: &str) -> Result<String, ApiError> {
     if tipo.is_empty() || id.trim().is_empty() {
         return Err(ApiError::bad_request(
             "`tipo` e `id` no pueden estar vacíos",
@@ -68,31 +68,40 @@ fn document_uid(tipo: &str, id: &str) -> Result<String, ApiError> {
 }
 
 /// Valida la petición y construye el documento junto con el término de su
-/// `uid`. Es la única definición de la forma de un documento: la usan tanto la
-/// API como `reindex`.
+/// `uid`.
 pub fn build_document(
     fields: &SearchFields,
-    payload: IndexDocumentRequest,
+    mut payload: IndexDocumentRequest,
 ) -> Result<(Term, TantivyDocument), ApiError> {
     // `/search` compara el filtro `tipo` ya recortado: lo guardamos igual.
-    let tipo = payload.tipo.trim();
-    let uid = document_uid(tipo, &payload.id)?;
+    payload.tipo = payload.tipo.trim().to_string();
+    let uid = document_uid(&payload.tipo, &payload.id)?;
+    Ok(into_document(fields, payload, uid))
+}
+
+/// Construye el documento de una petición ya validada. Es la única definición
+/// de la forma de un documento: la usan tanto la API como `reindex`.
+pub fn into_document(
+    fields: &SearchFields,
+    payload: IndexDocumentRequest,
+    uid: String,
+) -> (Term, TantivyDocument) {
     let term = Term::from_field_text(fields.uid, &uid);
 
     let mut document = doc!(
         fields.uid => uid,
         fields.id => payload.id,
-        fields.tipo => tipo,
+        fields.tipo => payload.tipo,
         fields.titulo => payload.titulo,
         fields.subtitulo => payload.subtitulo,
         fields.contenido => payload.contenido,
         fields.fecha => payload.fecha,
     );
-    // Como en `reindex`: sólo los documentos que lo tienen llevan `info_title`.
+    // Sólo los documentos que lo tienen (los `info_doc`) llevan `info_title`.
     if !payload.info_title.is_empty() {
         document.add_text(fields.info_title, payload.info_title);
     }
-    Ok((term, document))
+    (term, document)
 }
 
 pub async fn upsert_document(
@@ -120,7 +129,8 @@ pub async fn upsert_documents(
 ) -> Result<Json<BatchResponse>, ApiError> {
     let documents = payload
         .into_iter()
-        .map(|item| build_document(&state.fields, item))
+        .enumerate()
+        .map(|(index, item)| build_document(&state.fields, item).map_err(|err| err.for_item(index)))
         .collect::<Result<Vec<_>, _>>()?;
     let indexed = documents.len();
 

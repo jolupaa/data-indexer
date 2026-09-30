@@ -54,6 +54,20 @@ impl AppState {
             .map_err(ApiError::internal)
     }
 
+    /// Descarta las operaciones pendientes del writer. Si el propio rollback
+    /// falla, tantivy deja ese writer inservible (sin su lock, y un segundo
+    /// rollback entraría en pánico), así que se sustituye por uno nuevo.
+    fn discard_pending(&self, writer: &mut IndexWriter) {
+        let Err(err) = writer.rollback() else {
+            return;
+        };
+        eprintln!("Error al deshacer cambios pendientes: {err}");
+        match self.index.writer(WRITER_MEMORY_BYTES) {
+            Ok(fresh) => *writer = fresh,
+            Err(err) => eprintln!("No se pudo recrear el writer del índice: {err}"),
+        }
+    }
+
     fn write_blocking<F>(&self, ops: F) -> tantivy::Result<()>
     where
         F: FnOnce(&IndexWriter) -> tantivy::Result<()>,
@@ -66,7 +80,7 @@ impl AppState {
                 // su alta): se descartan en vez de dejar que este commit las
                 // confirme, y el servidor sigue aceptando escrituras.
                 let mut writer = poisoned.into_inner();
-                rollback(&mut writer);
+                self.discard_pending(&mut writer);
                 self.writer.clear_poison();
                 writer
             }
@@ -74,7 +88,7 @@ impl AppState {
 
         let result = ops(&writer).and_then(|()| writer.commit().map(|_| ()));
         if let Err(err) = result {
-            rollback(&mut writer);
+            self.discard_pending(&mut writer);
             return Err(err);
         }
         drop(writer);
@@ -85,12 +99,6 @@ impl AppState {
             eprintln!("Error al recargar el lector tras un commit: {err}");
         }
         Ok(())
-    }
-}
-
-fn rollback(writer: &mut IndexWriter) {
-    if let Err(err) = writer.rollback() {
-        eprintln!("Error al deshacer cambios pendientes: {err}");
     }
 }
 

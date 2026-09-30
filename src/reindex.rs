@@ -7,10 +7,10 @@ use tantivy::{
     directory::{Directory, INDEX_WRITER_LOCK, MmapDirectory},
 };
 
-use crate::indexer::{IndexDocumentRequest, build_document};
+use crate::indexer::{IndexDocumentRequest, document_uid, into_document};
 use crate::init::{
-    SearchFields, WRITER_MEMORY_BYTES, build_schema, create_index_in, explain_lock_error,
-    register_tokenizers,
+    IndexStatus, REBUILD_MARKER, SearchFields, WRITER_MEMORY_BYTES, create_index_in,
+    explain_lock_error, inspect_index,
 };
 use crate::utils::*;
 
@@ -37,9 +37,9 @@ struct InfoDoc {
 ///
 /// Se reconstruye dentro del propio índice: se marcan todos los documentos como
 /// borrados, se añaden los de la base de datos y se confirma todo en un único
-/// commit. Hasta ese commit el índice anterior sigue intacto (si PostgreSQL
-/// falla a mitad no se pierde nada), y no hace falta mover ni borrar el
-/// directorio, lo que fallaría si `INDEX_DIR` es un punto de montaje.
+/// commit. Hasta ese commit el índice en disco conserva su contenido anterior
+/// (si PostgreSQL falla a mitad no se pierde nada), y no hace falta mover ni
+/// borrar el directorio, lo que fallaría si `INDEX_DIR` es un punto de montaje.
 ///
 /// Durante todo el proceso se mantiene el lock de escritura del índice, así que
 /// no puede ejecutarse con un `serve` en marcha sobre el mismo directorio.
@@ -52,14 +52,12 @@ pub async fn reindex() -> Result<()> {
         .await
         .context("no se pudo conectar a PostgreSQL")?;
 
-    let (mut index_writer, fields) = open_for_rebuild(&dir)?;
+    let (index_writer, fields) = open_for_rebuild(&dir)?;
 
     let noticias = index_noticias(&pool, &index_writer, fields).await?;
     let info_docs = index_infodocs(&pool, &index_writer, fields).await?;
 
-    index_writer.commit()?;
-    // Deja terminadas las fusiones de segmentos antes de salir del proceso.
-    index_writer.wait_merging_threads()?;
+    finish_rebuild(&dir, index_writer)?;
     pool.close().await;
 
     println!("Indexados {noticias} noticias y {info_docs} info_docs.");
@@ -77,49 +75,80 @@ fn open_for_rebuild(dir: &Path) -> Result<(IndexWriter, SearchFields)> {
     Ok((index_writer, fields))
 }
 
-/// Abre el índice de `dir` o lo crea si no hay ninguno. Se niega a tocar un
-/// directorio con contenido que no sea un índice, para no escribir en uno
-/// equivocado por un `INDEX_DIR` mal puesto.
-///
-/// Un índice creado con otro esquema (el de una versión anterior) no sirve
-/// para esta versión: se vacía y se crea de nuevo. Cualquier otro error al
-/// abrirlo se devuelve sin tocar nada.
+/// Confirma la reconstrucción y da por terminada la de un índice creado desde
+/// cero (ver `REBUILD_MARKER`).
+fn finish_rebuild(dir: &Path, mut index_writer: IndexWriter) -> Result<()> {
+    index_writer.commit()?;
+    // Deja terminadas las fusiones de segmentos antes de salir del proceso.
+    index_writer.wait_merging_threads()?;
+
+    match std::fs::remove_file(dir.join(REBUILD_MARKER)) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).context("no se pudo borrar la marca de reconstrucción incompleta")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Abre el índice de `dir` o lo crea si no hay ninguno. Un índice de una versión
+/// anterior no sirve para esta: se sustituye por uno vacío. Cualquier otro error
+/// al abrirlo se devuelve sin tocar nada.
 fn prepare_index(dir: &Path) -> Result<(Index, SearchFields)> {
-    if !dir.join("meta.json").is_file() {
-        if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
+    match inspect_index(dir)? {
+        IndexStatus::Ready(index, fields) => Ok((index, fields)),
+        IndexStatus::Missing => {
+            ensure_only_index_files(dir)?;
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("no se pudo crear {}", dir.display()))?;
+            recreate_index(dir)
+        }
+        IndexStatus::Outdated => {
+            println!(
+                "El índice de {} es de una versión anterior: se crea de nuevo.",
+                dir.display()
+            );
+            recreate_index(dir)
+        }
+    }
+}
+
+/// Se niega a usar un directorio con contenido ajeno al índice, para no
+/// mezclarlo con datos de otra cosa por un `INDEX_DIR` mal puesto.
+fn ensure_only_index_files(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if !is_index_file(&name) && name != "lost+found" {
             bail!(
-                "{} no está vacío y no contiene un índice (falta meta.json); no se usará",
+                "{} contiene ficheros que no son de un índice (p. ej. {name}); no se usará",
                 dir.display()
             );
         }
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("no se pudo crear {}", dir.display()))?;
-        return create_index_in(dir);
     }
-
-    let index = Index::open_in_dir(dir).with_context(|| {
-        format!(
-            "no se pudo abrir el índice en {} (si está dañado, borra el directorio \
-             y vuelve a ejecutar `reindex`)",
-            dir.display()
-        )
-    })?;
-    let (schema, fields) = build_schema();
-    if index.schema() == schema {
-        register_tokenizers(&index);
-        return Ok((index, fields));
-    }
-
-    println!(
-        "El índice de {} es de una versión anterior: se crea de nuevo.",
-        dir.display()
-    );
-    drop(index);
-    recreate_index(dir)
+    Ok(())
 }
 
-/// Borra el índice de `dir` y crea uno vacío con el esquema actual, con el lock
-/// de escritura tomado para no pisar a un `serve` (de esta u otra versión).
+/// Ficheros que crea tantivy (o `reindex`) en el directorio del índice.
+fn is_index_file(name: &str) -> bool {
+    // Segmentos: "<uuid en 32 hex>.<extensión>" y "<uuid>.<opstamp>.del".
+    let is_segment_file = name.len() > 33
+        && name.as_bytes()[32] == b'.'
+        && name[..32].bytes().all(|b| b.is_ascii_hexdigit());
+    is_segment_file
+        || name == "meta.json"
+        || name == ".managed.json"
+        || name.starts_with(".tantivy-")
+        || name == REBUILD_MARKER
+}
+
+/// Borra el índice de `dir` (sólo sus ficheros: `lost+found` o cualquier otra
+/// cosa se deja en paz) y crea uno vacío con el esquema actual. Lo hace con el
+/// lock de escritura tomado, para no pisar a un `serve` de esta u otra versión,
+/// y dejando la marca de reconstrucción incompleta hasta que `reindex` confirme
+/// la carga: así `serve` no sirve un índice vacío si la carga falla.
 fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
     let directory =
         MmapDirectory::open(dir).with_context(|| format!("no se pudo abrir {}", dir.display()))?;
@@ -127,39 +156,43 @@ fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
         .acquire_lock(&INDEX_WRITER_LOCK)
         .map_err(|err| explain_lock_error(TantivyError::LockFailure(err, None), dir))?;
 
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_name() == INDEX_WRITER_LOCK.filepath.as_os_str() {
-            continue;
-        }
-        let path = entry.path();
-        let removed = if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        removed.with_context(|| format!("no se pudo borrar {}", path.display()))?;
+    std::fs::write(dir.join(REBUILD_MARKER), b"")
+        .context("no se pudo crear la marca de reconstrucción incompleta")?;
+
+    let mut stale: Vec<_> = std::fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
+    stale.retain(|path| {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        is_index_file(&name) && !name.starts_with(".tantivy-") && name != REBUILD_MARKER
+    });
+    // `meta.json` el último: si algo falla antes, sigue siendo un índice
+    // (viejo) que el siguiente `reindex` reconocerá y volverá a sustituir.
+    stale.sort_by_key(|path| path.ends_with("meta.json"));
+    for path in stale {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("no se pudo borrar {}", path.display()))?;
     }
 
     create_index_in(dir)
 }
 
-/// Añade una fila al índice con la misma función que usa `/index/upsert`, para
-/// que el documento tenga la misma forma venga por donde venga. Las filas que
-/// no pasan la validación se omiten con un aviso.
+/// Añade una fila al índice con las mismas funciones que usa `/index/upsert`,
+/// para que el documento tenga la misma forma venga por donde venga. Las filas
+/// que no pasan la validación se omiten con un aviso.
 fn index_row(
     index_writer: &IndexWriter,
     fields: SearchFields,
     request: IndexDocumentRequest,
 ) -> Result<bool> {
-    let uid = make_uid(&request.tipo, &request.id);
-    match build_document(&fields, request) {
-        Ok((_, document)) => {
+    match document_uid(&request.tipo, &request.id) {
+        Ok(uid) => {
+            let (_, document) = into_document(&fields, request, uid);
             index_writer.add_document(document)?;
             Ok(true)
         }
         Err(err) => {
-            eprintln!("Aviso: se omite {uid}: {err}");
+            eprintln!("Aviso: se omite {}:{}: {err}", request.tipo, request.id);
             Ok(false)
         }
     }
@@ -266,8 +299,30 @@ mod tests {
     fn creates_the_index_when_missing() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("nuevo").join("search_index");
-        open_for_rebuild(&dir).unwrap();
+        let (writer, _) = open_for_rebuild(&dir).unwrap();
+
+        // Mientras no se confirme la carga, `serve` no lo da por bueno.
+        drop(writer);
+        let Err(err) = open_index(&dir) else {
+            panic!("no debería servir un índice a medio construir");
+        };
+        assert!(err.to_string().contains("no terminó"), "{err}");
+
+        let (writer, _) = open_for_rebuild(&dir).unwrap();
+        finish_rebuild(&dir, writer).unwrap();
         open_index(&dir).unwrap();
+    }
+
+    #[test]
+    fn accepts_a_fresh_mount_point_with_lost_and_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lost_found = tmp.path().join("lost+found");
+        std::fs::create_dir(&lost_found).unwrap();
+
+        let (writer, _) = open_for_rebuild(tmp.path()).unwrap();
+        finish_rebuild(tmp.path(), writer).unwrap();
+        open_index(tmp.path()).unwrap();
+        assert!(lost_found.is_dir());
     }
 
     #[test]
@@ -307,10 +362,9 @@ mod tests {
         assert_eq!(num_docs(tmp.path()), 1);
 
         // Una que llega al commit sustituye todo el contenido.
-        let (mut writer, fields) = open_for_rebuild(tmp.path()).unwrap();
+        let (writer, fields) = open_for_rebuild(tmp.path()).unwrap();
         writer.add_document(doc!(fields.id => "nuevo")).unwrap();
-        writer.commit().unwrap();
-        drop(writer);
+        finish_rebuild(tmp.path(), writer).unwrap();
 
         let (index, fields) = open_index(tmp.path()).unwrap();
         let searcher = index.reader().unwrap().searcher();
@@ -343,11 +397,58 @@ mod tests {
     fn recreates_an_index_from_an_older_version() {
         let tmp = tempfile::tempdir().unwrap();
         let mut builder = Schema::builder();
-        builder.add_text_field("id", STRING | STORED);
+        let id = builder.add_text_field("id", STRING | STORED);
         builder.add_text_field("titulo", TEXT | STORED);
-        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+        let old = Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+        let mut old_writer: IndexWriter = old.writer(15_000_000).unwrap();
+        old_writer.add_document(doc!(id => "viejo")).unwrap();
+        old_writer.commit().unwrap();
+        drop(old_writer);
 
-        open_for_rebuild(tmp.path()).unwrap();
-        open_index(tmp.path()).unwrap();
+        let notes = tmp.path().join("notas.txt");
+        std::fs::write(&notes, "del usuario").unwrap();
+        std::fs::create_dir(tmp.path().join("lost+found")).unwrap();
+
+        // Si la carga falla tras recrearlo, `serve` no sirve el índice vacío.
+        let (writer, _) = open_for_rebuild(tmp.path()).unwrap();
+        drop(writer);
+        assert!(open_index(tmp.path()).is_err());
+
+        let (writer, _) = open_for_rebuild(tmp.path()).unwrap();
+        finish_rebuild(tmp.path(), writer).unwrap();
+        assert_eq!(num_docs(tmp.path()), 0);
+
+        // Sólo se borran los ficheros del índice.
+        assert!(notes.exists());
+        assert!(tmp.path().join("lost+found").is_dir());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.len() > 33 && name.as_bytes()[32] == b'.')
+            .collect();
+        let (index, _) = open_index(tmp.path()).unwrap();
+        let live: Vec<String> = index
+            .searchable_segment_metas()
+            .unwrap()
+            .iter()
+            .flat_map(|meta| meta.list_files())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.iter().all(|name| live.contains(name)),
+            "quedan segmentos del índice viejo: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn recognises_index_files() {
+        assert!(is_index_file("meta.json"));
+        assert!(is_index_file(".managed.json"));
+        assert!(is_index_file(".tantivy-writer.lock"));
+        assert!(is_index_file("0123456789abcdef0123456789abcdef.idx"));
+        assert!(is_index_file("0123456789abcdef0123456789abcdef.12.del"));
+        assert!(!is_index_file("lost+found"));
+        assert!(!is_index_file("notas.txt"));
+        assert!(!is_index_file("0123456789abcdef0123456789abcdeg.idx"));
     }
 }

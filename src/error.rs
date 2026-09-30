@@ -18,12 +18,22 @@ impl ApiError {
         }
     }
 
-    /// Error inesperado del servidor: se registra en stderr y se responde 500.
+    /// Error inesperado del servidor: el detalle (rutas, mensajes de pánico…)
+    /// sólo va a stderr; al cliente, que puede acabar mostrándolo a usuarios
+    /// finales, se le responde 500 con un mensaje genérico.
     pub fn internal(err: impl std::fmt::Display) -> Self {
         eprintln!("Error interno: {err}");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: err.to_string(),
+            message: "error interno del servidor".to_string(),
+        }
+    }
+
+    /// Indica a qué elemento de un lote se refiere el error.
+    pub fn for_item(self, index: usize) -> Self {
+        Self {
+            message: format!("documento {index}: {}", self.message),
+            ..self
         }
     }
 }

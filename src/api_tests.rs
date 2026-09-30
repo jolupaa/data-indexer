@@ -258,8 +258,8 @@ async fn batch_upsert_indexes_everything_in_one_commit() {
     assert_eq!(ids(&results), ["1", "2"]);
     assert_eq!(ids(&search(&app, "q=final").await), ["1"]);
 
-    // Un documento inválido rechaza el lote entero.
-    let (status, _) = send(
+    // Un documento inválido rechaza el lote entero, e indica cuál es.
+    let (status, body) = send(
         &app,
         Method::POST,
         "/index/upsert/batch",
@@ -267,6 +267,7 @@ async fn batch_upsert_indexes_everything_in_one_commit() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.starts_with("documento 1:"), "{body}");
     assert!(search(&app, "q=nuevo").await.is_empty());
 }
 

@@ -62,7 +62,7 @@ cargo run --release -- serve
 | `POST`   | `/index/upsert/batch` | Insert or replace many documents in one commit. |
 | `DELETE` | `/index/delete`       | Delete a document by `tipo` + `id`.             |
 | `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=`).  |
-| `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.     |
+| `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.    |
 
 ### Example
 

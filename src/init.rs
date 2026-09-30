@@ -100,32 +100,69 @@ pub fn create_index_in(dir: &Path) -> Result<(Index, SearchFields)> {
     Ok((index, fields))
 }
 
-/// Abre el índice de `dir` comprobando que se creó con el esquema (y el
-/// analizador) de esta versión. Los `Field` se reconstruyen con
-/// `build_schema`, así que un índice con otro esquema haría que cada valor
-/// acabase en el campo equivocado: en ese caso es obligatorio reindexar.
-pub fn open_index(dir: &Path) -> Result<(Index, SearchFields)> {
+/// Fichero que `reindex` deja en el directorio mientras crea un índice desde
+/// cero y que borra al confirmar la carga. Si sigue ahí, esa reconstrucción no
+/// terminó y el índice está vacío o a medias.
+pub const REBUILD_MARKER: &str = ".reindex-incompleto";
+
+/// Qué hay en el directorio del índice.
+pub enum IndexStatus {
+    /// No hay índice (falta `meta.json`).
+    Missing,
+    /// Un índice creado con otro esquema o analizador (una versión anterior).
+    Outdated,
+    /// Un índice de esta versión, con el analizador ya registrado.
+    Ready(Index, SearchFields),
+}
+
+/// Examina el índice de `dir`. Los `Field` se reconstruyen con `build_schema`,
+/// así que un índice con otro esquema haría que cada valor acabase en el campo
+/// equivocado: por eso se distingue como `Outdated`.
+pub fn inspect_index(dir: &Path) -> Result<IndexStatus> {
     if !dir.join("meta.json").is_file() {
-        bail!(
-            "no hay ningún índice en {}; ejecuta `reindex` primero",
-            dir.display()
-        );
+        return Ok(IndexStatus::Missing);
     }
 
-    let index = Index::open_in_dir(dir)
-        .with_context(|| format!("no se pudo abrir el índice en {}", dir.display()))?;
+    let index = Index::open_in_dir(dir).with_context(|| {
+        format!(
+            "no se pudo abrir el índice en {} (si está dañado, vacía el directorio y \
+             ejecuta `reindex`)",
+            dir.display()
+        )
+    })?;
 
     let (schema, fields) = build_schema();
     if index.schema() != schema {
+        return Ok(IndexStatus::Outdated);
+    }
+
+    register_tokenizers(&index);
+    Ok(IndexStatus::Ready(index, fields))
+}
+
+/// Abre el índice de `dir` para servirlo: tiene que ser de esta versión y no
+/// estar a medio reconstruir.
+pub fn open_index(dir: &Path) -> Result<(Index, SearchFields)> {
+    if dir.join(REBUILD_MARKER).exists() {
         bail!(
-            "el índice en {} se creó con un esquema o analizador distinto al de esta \
-             versión; ejecuta `reindex` para regenerarlo",
+            "un `reindex` anterior no terminó y el índice de {} está incompleto; \
+             ejecuta `reindex` de nuevo",
             dir.display()
         );
     }
 
-    register_tokenizers(&index);
-    Ok((index, fields))
+    match inspect_index(dir)? {
+        IndexStatus::Ready(index, fields) => Ok((index, fields)),
+        IndexStatus::Missing => bail!(
+            "no hay ningún índice en {}; ejecuta `reindex` primero",
+            dir.display()
+        ),
+        IndexStatus::Outdated => bail!(
+            "el índice en {} se creó con un esquema o analizador distinto al de esta \
+             versión; ejecuta `reindex` para regenerarlo",
+            dir.display()
+        ),
+    }
 }
 
 /// Traduce el error de "lock ocupado" de tantivy a un mensaje accionable.

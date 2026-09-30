@@ -76,18 +76,24 @@ cargo run --release -- serve
 
 #### How `reindex` behaves
 
+- It connects to PostgreSQL first, so an unreachable database changes nothing.
 - The index is rebuilt in place and all changes land in a single commit: until
-  that commit, searches keep seeing the previous contents, and if PostgreSQL
+  that commit the index on disk keeps its previous contents, so if PostgreSQL
   fails half-way the previous index is left untouched. The directory itself is
   never moved or deleted, so `INDEX_DIR` can be a symlink or a mount point
-  (e.g. a Docker volume).
+  (e.g. a Docker volume; a `lost+found` inside it is fine).
 - It **refuses to run while `serve` is using the same index** (it takes the
   index write lock). A running server would keep writing into the replaced
   index and corrupt it. Stop `serve`, run `reindex`, start `serve` again.
-- It refuses to use a directory that is not empty and does not look like an
-  index (no `meta.json`), so a mistyped `INDEX_DIR` can't clobber other data.
-  If the existing index can't be opened (e.g. it is damaged), it stops without
-  touching it; delete the directory yourself and run `reindex` again.
+- It refuses to use a directory that has no index (`meta.json`) but contains
+  other files, so a mistyped `INDEX_DIR` can't clobber other data. It only ever
+  deletes Tantivy's own files.
+- If the existing index can't be opened (e.g. it is damaged), it stops without
+  touching it; empty the directory yourself and run `reindex` again.
+- When it has to create the index from scratch (first run, or after an
+  upgrade), it leaves a `.reindex-incompleto` marker until the load is
+  committed. If the load fails, `serve` refuses to start with an empty or
+  half-built index and asks you to run `reindex` again.
 - `NULL` columns are indexed as empty strings.
 
 #### Upgrading
@@ -98,6 +104,9 @@ plurals were fixed), `serve` refuses to open an index built by the old version
 and asks you to run `reindex`. Run it once after upgrading. In that case
 `reindex` discards the old index before loading from PostgreSQL (the old one
 is unusable by the new version anyway).
+
+The reverse also holds: older versions can't use an index built by this one,
+so if you ever roll back, run the older version's `reindex` too.
 
 #### Shutdown
 
@@ -212,8 +221,9 @@ The request body may be up to 64 MB (the other routes keep the default 2 MB).
 
 Same as `/index/upsert` but takes a JSON **array** of documents and applies them
 all in a single commit, which is much cheaper than one request per document.
-It is all-or-nothing: if any document is invalid, nothing is written. If the
-same `tipo`+`id` appears more than once, the last one wins.
+It is all-or-nothing: if any document is invalid, nothing is written and the
+`400` message starts with its position in the array (`documento 17: …`). If
+the same `tipo`+`id` appears more than once, the last one wins.
 
 **Response** — `200 OK`
 
@@ -305,7 +315,9 @@ An array of results, ordered by descending relevance `score`:
 | `400`  | Missing `q`, `q` longer than 1000 characters, or invalid `limit`/`offset`. |
 | `500`  | Internal error (index read or search failure).                             |
 
-The body of an error is a plain-text message, not JSON.
+The body of an error is a plain-text message, not JSON. For `500` it is always
+`error interno del servidor`; the details go to the server's stderr only, so
+paths or internal messages never reach your users.
 
 ### 4.5 `GET /health`
 
