@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::path::Path;
 use tantivy::{
     Index, TantivyError,
@@ -117,7 +118,11 @@ pub enum IndexStatus {
 
 /// Campos de los índices de cada versión de data-indexer: la primera y las que
 /// añadieron `uid`, `subtitulo` e `info_title` (la actual). Un índice con otros
-/// campos es de otra aplicación y no se toca.
+/// campos es de otra aplicación (o de una versión más nueva) y no se toca.
+///
+/// Si cambian los campos de `build_schema`, añade el conjunto nuevo al final;
+/// no edites los anteriores o dejarán de reconocerse (y de migrarse) los
+/// índices de esas versiones.
 const KNOWN_FIELD_SETS: [&[&str]; 2] = [
     &["id", "tipo", "titulo", "contenido", "autor", "fecha"],
     &[
@@ -154,21 +159,19 @@ pub fn inspect_index(dir: &Path) -> Result<IndexStatus> {
         .map_err(anyhow::Error::from)
         .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
         .with_context(damaged)?;
-    let mut field_names: Vec<&str> = meta["schema"]
+    let field_names: Vec<&str> = meta["schema"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|field| field["name"].as_str())
         .collect();
-    field_names.sort_unstable();
-    let is_ours = KNOWN_FIELD_SETS.iter().any(|known| {
-        let mut known = known.to_vec();
-        known.sort_unstable();
-        known == field_names
-    });
-    if !is_ours {
+    if !KNOWN_FIELD_SETS
+        .iter()
+        .any(|known| same_fields(known, &field_names))
+    {
         bail!(
-            "{} contiene un índice que no es de data-indexer; no se usará",
+            "{} contiene un índice que no es de data-indexer (o es de una versión \
+             más nueva); no se usará",
             dir.display()
         );
     }
@@ -181,6 +184,11 @@ pub fn inspect_index(dir: &Path) -> Result<IndexStatus> {
 
     register_tokenizers(&index);
     Ok(IndexStatus::Ready(index, fields))
+}
+
+/// Si dos listas tienen los mismos campos, sin importar el orden.
+fn same_fields(a: &[&str], b: &[&str]) -> bool {
+    a.len() == b.len() && a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()
 }
 
 /// Abre el índice de `dir` para servirlo: tiene que ser de esta versión y no
@@ -266,11 +274,9 @@ pub(crate) mod tests {
         // Si se añade un campo, hay que añadir el conjunto actual a
         // `KNOWN_FIELD_SETS` para que la siguiente versión lo reconozca.
         let (schema, _) = build_schema();
-        let mut current: Vec<&str> = schema.fields().map(|(_, entry)| entry.name()).collect();
-        current.sort_unstable();
-        let mut latest = KNOWN_FIELD_SETS[KNOWN_FIELD_SETS.len() - 1].to_vec();
-        latest.sort_unstable();
-        assert_eq!(current, latest);
+        let current: Vec<&str> = schema.fields().map(|(_, entry)| entry.name()).collect();
+        let latest = KNOWN_FIELD_SETS[KNOWN_FIELD_SETS.len() - 1];
+        assert!(same_fields(&current, latest), "{current:?} != {latest:?}");
     }
 
     #[test]

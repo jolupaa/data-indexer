@@ -126,7 +126,7 @@ fn ensure_only_index_files(dir: &Path) -> Result<()> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let is_ours = !entry.file_type()?.is_dir() && is_index_file(&name);
+        let is_ours = entry.file_type()?.is_file() && is_index_file(&name);
         if !is_ours && name != "lost+found" {
             bail!(
                 "{} contiene ficheros que no son de un índice (p. ej. {name}); no se usará",
@@ -183,7 +183,19 @@ fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
         .acquire_lock(&INDEX_WRITER_LOCK)
         .map_err(|err| explain_lock_error(TantivyError::LockFailure(err, None), dir))?;
 
-    std::fs::write(dir.join(REBUILD_MARKER), b"")
+    // Siempre un fichero nuevo: si hubiera algo con ese nombre (p. ej. un
+    // enlace), escribir en él podría acabar fuera del directorio del índice.
+    let marker = dir.join(REBUILD_MARKER);
+    match std::fs::remove_file(&marker) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(err).context("no se pudo sustituir la marca de reconstrucción");
+        }
+        _ => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
         .context("no se pudo crear la marca de reconstrucción incompleta")?;
 
     let mut stale = Vec::new();
