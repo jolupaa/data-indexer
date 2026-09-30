@@ -11,10 +11,13 @@ and search documents — designed to sit behind a Node.js (or any) backend.
 
 ## Features
 
-- Full-text search over `titulo`, `subtitulo`, and `contenido`.
-- Optional filtering by document type (`tipo`) and a configurable result `limit`.
-- Idempotent upsert keyed by a composite `uid` (`tipo:id`).
-- One-shot bulk `reindex` straight from PostgreSQL.
+- Full-text search over `titulo`, `subtitulo`, `info_title`, and `contenido`,
+  insensitive to case and accents and to Spanish singular/plural
+  (`clase` ≈ `clases`, `actualización` ≈ `actualizaciones`).
+- Optional filtering by document type (`tipo`), `limit` and `offset` pagination.
+- Idempotent upsert keyed by a composite `uid` (`tipo:id`), single or batched.
+- Safe bulk `reindex` straight from PostgreSQL: the rebuild is applied in a
+  single commit, so a failure half-way leaves the previous index intact.
 
 ## Requirements
 
@@ -34,20 +37,32 @@ DB_URL="postgres://user:password@localhost:5432/mydb" cargo run --release -- rei
 cargo run --release -- serve
 ```
 
+> **Upgrading from an earlier version?** The text analyzer changed, so run
+> `reindex` once (with `serve` stopped). `serve` refuses to open an index built
+> by an older version and tells you so.
+
 ## Commands
 
-| Command   | Description                                                          |
-| --------- | ------------------------------------------------------------------- |
-| `reindex` | Wipes and rebuilds `./search_index` from PostgreSQL. Needs `DB_URL`.|
-| `serve`   | Serves the existing index over HTTP on `127.0.0.1:5000` (default).  |
+| Command   | Description                                                                 |
+| --------- | --------------------------------------------------------------------------- |
+| `reindex` | Rebuilds the index from PostgreSQL. Needs `DB_URL`. Stop `serve` first.     |
+| `serve`   | Serves the existing index over HTTP on `127.0.0.1:5000` (default command).  |
+
+| Variable    | Default           | Description                          |
+| ----------- | ----------------- | ------------------------------------ |
+| `DB_URL`    | —                 | PostgreSQL URL (only for `reindex`). |
+| `INDEX_DIR` | `./search_index`  | Where the index lives.               |
+| `BIND_ADDR` | `127.0.0.1:5000`  | Address `serve` listens on.          |
 
 ## HTTP API
 
-| Method   | Path             | Purpose                                  |
-| -------- | ---------------- | ---------------------------------------- |
-| `POST`   | `/index/upsert`  | Insert or replace a document.            |
-| `DELETE` | `/index/delete`  | Delete a document by `tipo` + `id`.      |
-| `GET`    | `/search`        | Full-text search (`?q=&tipo=&limit=`).   |
+| Method   | Path                  | Purpose                                         |
+| -------- | --------------------- | ----------------------------------------------- |
+| `POST`   | `/index/upsert`       | Insert or replace a document.                   |
+| `POST`   | `/index/upsert/batch` | Insert or replace many documents in one commit. |
+| `DELETE` | `/index/delete`       | Delete a document by `tipo` + `id`.             |
+| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=`).  |
+| `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.     |
 
 ### Example
 
@@ -87,10 +102,11 @@ fields are array-valued and `contenido` is searchable but not returned).
 
 ## Notes
 
-- The server binds to `127.0.0.1` only and has **no authentication** — keep it
-  behind your backend or a proxy.
+- The server binds to `127.0.0.1` by default and has **no authentication** —
+  keep it behind your backend or a proxy.
 - `serve` requires that `reindex` has been run at least once.
 - All document fields are strings.
+- `limit` is capped at 1000, `offset` at 10000 and `q` at 1000 characters.
 
 ## License
 

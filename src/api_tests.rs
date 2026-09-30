@@ -207,6 +207,10 @@ async fn tipo_filter_and_info_title() {
         info[0]["doc"]["info_title"],
         json!(["Presupuestos anuales"])
     );
+
+    // `*` con `tipo` lista la categoría entera.
+    assert_eq!(ids(&search(&app, "q=*&tipo=noticia").await), ["1"]);
+    assert_eq!(search(&app, "q=*").await.len(), 2);
 }
 
 #[tokio::test]

@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
 use futures_util::TryStreamExt;
 use sqlx::PgPool;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tantivy::{
-    IndexWriter, TantivyError,
-    directory::{Directory, DirectoryLock, INDEX_WRITER_LOCK, MmapDirectory},
+    Index, IndexWriter, TantivyError,
+    directory::{Directory, INDEX_WRITER_LOCK, MmapDirectory},
     doc,
 };
 
-use crate::init::{SearchFields, create_index_in, explain_lock_error};
+use crate::init::{SearchFields, create_index_in, explain_lock_error, open_index};
 use crate::utils::*;
 
 /// Memoria del `IndexWriter` durante la carga masiva.
@@ -35,43 +35,23 @@ struct InfoDoc {
 
 /// Reconstruye el índice completo desde PostgreSQL.
 ///
-/// El índice nuevo se construye en un directorio aparte y sólo sustituye al
-/// actual cuando está completo: si la base de datos falla a mitad, el índice
-/// anterior sigue intacto. Mientras dura, se mantiene el lock de escritura del
-/// índice actual, así que no puede ejecutarse con un `serve` en marcha sobre el
-/// mismo directorio (el servidor seguiría escribiendo en el índice sustituido).
+/// Se reconstruye dentro del propio índice: se marcan todos los documentos como
+/// borrados, se añaden los de la base de datos y se confirma todo en un único
+/// commit. Hasta ese commit el índice anterior sigue intacto (si PostgreSQL
+/// falla a mitad no se pierde nada), y no hace falta mover ni borrar el
+/// directorio, lo que fallaría si `INDEX_DIR` es un punto de montaje.
+///
+/// Durante todo el proceso se mantiene el lock de escritura del índice, así que
+/// no puede ejecutarse con un `serve` en marcha sobre el mismo directorio.
 pub async fn reindex() -> Result<()> {
     let database_url = std::env::var("DB_URL").context("variable DB_URL no encontrada")?;
     let dir = index_dir();
 
-    let lock = lock_existing_index(&dir)?;
+    let (mut index_writer, fields) = open_for_rebuild(&dir)?;
 
-    let tmp_dir = sibling_dir(&dir, "reindex-tmp")?;
-    if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir)
-            .with_context(|| format!("no se pudo borrar {}", tmp_dir.display()))?;
-    }
-    std::fs::create_dir_all(&tmp_dir)
-        .with_context(|| format!("no se pudo crear {}", tmp_dir.display()))?;
-
-    if let Err(err) = build_index(&database_url, &tmp_dir).await {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(err);
-    }
-
-    // Soltamos el lock antes de mover directorios (en Windows no se puede
-    // renombrar un directorio con ficheros abiertos).
-    drop(lock);
-    replace_dir(&tmp_dir, &dir)
-}
-
-async fn build_index(database_url: &str, dir: &Path) -> Result<()> {
-    let pool = PgPool::connect(database_url)
+    let pool = PgPool::connect(&database_url)
         .await
         .context("no se pudo conectar a PostgreSQL")?;
-
-    let (index, fields) = create_index_in(dir)?;
-    let mut index_writer: IndexWriter = index.writer(WRITER_MEMORY_BYTES)?;
 
     let noticias = index_noticias(&pool, &index_writer, fields).await?;
     let info_docs = index_infodocs(&pool, &index_writer, fields).await?;
@@ -83,6 +63,74 @@ async fn build_index(database_url: &str, dir: &Path) -> Result<()> {
 
     println!("Indexados {noticias} noticias y {info_docs} info_docs.");
     Ok(())
+}
+
+/// Prepara el índice de `dir` para reconstruirlo: lo crea si no existe, toma
+/// su lock de escritura y deja pendiente el borrado de todo su contenido.
+fn open_for_rebuild(dir: &Path) -> Result<(IndexWriter, SearchFields)> {
+    let (index, fields) = prepare_index(dir)?;
+    let index_writer: IndexWriter = index
+        .writer(WRITER_MEMORY_BYTES)
+        .map_err(|err| explain_lock_error(err, dir))?;
+    index_writer.delete_all_documents()?;
+    Ok((index_writer, fields))
+}
+
+/// Abre el índice de `dir` o lo crea si no hay ninguno. Se niega a tocar un
+/// directorio con contenido que no sea un índice, para no escribir en uno
+/// equivocado por un `INDEX_DIR` mal puesto.
+///
+/// Un índice que no se puede abrir con el esquema actual (el de una versión
+/// anterior, o uno dañado) no sirve para nada: se vacía y se crea de nuevo.
+fn prepare_index(dir: &Path) -> Result<(Index, SearchFields)> {
+    if !dir.join("meta.json").is_file() {
+        if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
+            bail!(
+                "{} no está vacío y no contiene un índice (falta meta.json); no se usará",
+                dir.display()
+            );
+        }
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("no se pudo crear {}", dir.display()))?;
+        return create_index_in(dir);
+    }
+
+    match open_index(dir) {
+        Ok(opened) => Ok(opened),
+        Err(_) => {
+            println!(
+                "El índice de {} es de otra versión o está dañado: se crea de nuevo.",
+                dir.display()
+            );
+            recreate_index(dir)
+        }
+    }
+}
+
+/// Borra el índice de `dir` y crea uno vacío con el esquema actual, con el lock
+/// de escritura tomado para no pisar a un `serve` (de esta u otra versión).
+fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
+    let directory =
+        MmapDirectory::open(dir).with_context(|| format!("no se pudo abrir {}", dir.display()))?;
+    let _lock = directory
+        .acquire_lock(&INDEX_WRITER_LOCK)
+        .map_err(|err| explain_lock_error(TantivyError::LockFailure(err, None), dir))?;
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == INDEX_WRITER_LOCK.filepath.as_os_str() {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("no se pudo borrar {}", path.display()))?;
+    }
+
+    create_index_in(dir)
 }
 
 pub async fn index_noticias(
@@ -161,104 +209,42 @@ pub async fn index_infodocs(
     Ok(count)
 }
 
-/// Si ya hay un índice en `dir`, toma su lock de escritura (falla si un
-/// `serve` lo tiene abierto). Se niega a continuar si `dir` tiene contenido que
-/// no es un índice, para no acabar borrando un directorio equivocado por un
-/// `INDEX_DIR` mal puesto.
-fn lock_existing_index(dir: &Path) -> Result<Option<DirectoryLock>> {
-    if !dir.exists() {
-        return Ok(None);
-    }
-    if !dir.is_dir() {
-        bail!("{} existe pero no es un directorio", dir.display());
-    }
-    if !dir.join("meta.json").is_file() {
-        let is_empty = std::fs::read_dir(dir)?.next().is_none();
-        if is_empty {
-            return Ok(None);
-        }
-        bail!(
-            "{} no está vacío y no contiene un índice (falta meta.json); no se reemplazará",
-            dir.display()
-        );
-    }
-
-    let directory =
-        MmapDirectory::open(dir).with_context(|| format!("no se pudo abrir {}", dir.display()))?;
-    let lock = directory
-        .acquire_lock(&INDEX_WRITER_LOCK)
-        .map_err(|err| explain_lock_error(TantivyError::LockFailure(err, None), dir))?;
-    Ok(Some(lock))
-}
-
-/// `dir` con un sufijo en el nombre: `./search_index` → `./search_index.<suffix>`.
-fn sibling_dir(dir: &Path, suffix: &str) -> Result<PathBuf> {
-    let name = dir
-        .file_name()
-        .with_context(|| format!("INDEX_DIR no válido: {}", dir.display()))?;
-    let mut sibling = name.to_os_string();
-    sibling.push(".");
-    sibling.push(suffix);
-    Ok(dir.with_file_name(sibling))
-}
-
-/// Sustituye `dir` por `new_dir`, restaurando el original si algo falla.
-fn replace_dir(new_dir: &Path, dir: &Path) -> Result<()> {
-    if !dir.exists() {
-        return std::fs::rename(new_dir, dir)
-            .with_context(|| format!("no se pudo mover el índice nuevo a {}", dir.display()));
-    }
-
-    let old_dir = sibling_dir(dir, "reindex-old")?;
-    if old_dir.exists() {
-        std::fs::remove_dir_all(&old_dir)
-            .with_context(|| format!("no se pudo borrar {}", old_dir.display()))?;
-    }
-    std::fs::rename(dir, &old_dir)
-        .with_context(|| format!("no se pudo apartar el índice anterior {}", dir.display()))?;
-
-    if let Err(err) = std::fs::rename(new_dir, dir) {
-        let _ = std::fs::rename(&old_dir, dir);
-        return Err(err)
-            .with_context(|| format!("no se pudo mover el índice nuevo a {}", dir.display()));
-    }
-
-    if let Err(err) = std::fs::remove_dir_all(&old_dir) {
-        eprintln!(
-            "Aviso: no se pudo borrar el índice anterior {}: {err}",
-            old_dir.display()
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init::open_index;
+    use tantivy::{
+        Term, collector::Count, query::AllQuery, schema::STORED, schema::STRING, schema::Schema,
+        schema::TEXT,
+    };
 
-    #[test]
-    fn sibling_dir_appends_suffix() {
-        assert_eq!(
-            sibling_dir(Path::new("./search_index"), "reindex-tmp").unwrap(),
-            PathBuf::from("./search_index.reindex-tmp")
-        );
-        assert_eq!(
-            sibling_dir(Path::new("data/idx/"), "reindex-old").unwrap(),
-            PathBuf::from("data/idx.reindex-old")
-        );
-        assert!(sibling_dir(Path::new("/"), "x").is_err());
-        assert!(sibling_dir(Path::new("."), "x").is_err());
+    fn num_docs(dir: &Path) -> usize {
+        let (index, _) = open_index(dir).unwrap();
+        let reader = index.reader().unwrap();
+        reader.searcher().search(&AllQuery, &Count).unwrap()
+    }
+
+    fn add_one(dir: &Path, id: &str) {
+        let (index, fields) = open_index(dir).unwrap();
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        writer.add_document(doc!(fields.id => id)).unwrap();
+        writer.commit().unwrap();
     }
 
     #[test]
-    fn refuses_to_replace_a_directory_that_is_not_an_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("importante.txt"), "no borrar").unwrap();
-        assert!(lock_existing_index(tmp.path()).is_err());
+    fn creates_the_index_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("nuevo").join("search_index");
+        open_for_rebuild(&dir).unwrap();
+        open_index(&dir).unwrap();
+    }
 
-        let empty = tempfile::tempdir().unwrap();
-        assert!(lock_existing_index(empty.path()).unwrap().is_none());
+    #[test]
+    fn refuses_a_non_empty_directory_that_is_not_an_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("importante.txt");
+        std::fs::write(&file, "no tocar").unwrap();
+        assert!(open_for_rebuild(tmp.path()).is_err());
+        assert!(file.exists());
     }
 
     #[test]
@@ -267,33 +253,52 @@ mod tests {
         let (index, _) = create_index_in(tmp.path()).unwrap();
         let writer: IndexWriter = index.writer(15_000_000).unwrap();
 
-        let Err(err) = lock_existing_index(tmp.path()) else {
+        let Err(err) = open_for_rebuild(tmp.path()) else {
             panic!("debería fallar con el writer abierto");
         };
         assert!(err.to_string().contains("en uso"), "{err}");
 
         drop(writer);
-        assert!(lock_existing_index(tmp.path()).unwrap().is_some());
+        open_for_rebuild(tmp.path()).unwrap();
     }
 
     #[test]
-    fn replace_dir_swaps_in_the_new_index() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("search_index");
-        let new_dir = root.path().join("search_index.reindex-tmp");
+    fn old_documents_survive_until_the_rebuild_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_index_in(tmp.path()).unwrap();
+        add_one(tmp.path(), "viejo");
 
-        std::fs::create_dir_all(&dir).unwrap();
-        create_index_in(&dir).unwrap();
-        std::fs::write(dir.join("viejo"), "").unwrap();
+        // Una reconstrucción que falla antes del commit no borra nada.
+        let (writer, fields) = open_for_rebuild(tmp.path()).unwrap();
+        writer.add_document(doc!(fields.id => "a medias")).unwrap();
+        drop(writer);
+        assert_eq!(num_docs(tmp.path()), 1);
 
-        std::fs::create_dir_all(&new_dir).unwrap();
-        create_index_in(&new_dir).unwrap();
+        // Una que llega al commit sustituye todo el contenido.
+        let (mut writer, fields) = open_for_rebuild(tmp.path()).unwrap();
+        writer.add_document(doc!(fields.id => "nuevo")).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
 
-        replace_dir(&new_dir, &dir).unwrap();
+        let (index, fields) = open_index(tmp.path()).unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        assert_eq!(searcher.search(&AllQuery, &Count).unwrap(), 1);
+        let nuevo = tantivy::query::TermQuery::new(
+            Term::from_field_text(fields.id, "nuevo"),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        assert_eq!(searcher.search(&nuevo, &Count).unwrap(), 1);
+    }
 
-        assert!(!new_dir.exists());
-        assert!(!root.path().join("search_index.reindex-old").exists());
-        assert!(!dir.join("viejo").exists());
-        open_index(&dir).unwrap();
+    #[test]
+    fn recreates_an_index_from_an_older_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("titulo", TEXT | STORED);
+        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+
+        open_for_rebuild(tmp.path()).unwrap();
+        open_index(tmp.path()).unwrap();
     }
 }
