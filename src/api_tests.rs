@@ -88,6 +88,8 @@ async fn upsert_is_searchable_immediately_and_replaces_by_uid() {
     assert_eq!(results[0]["doc"]["titulo"], json!(["Segunda versión"]));
     assert_eq!(results[0]["doc"]["uid"], json!(["noticia:1"]));
     assert!(results[0]["doc"].get("contenido").is_none());
+    // Igual que las noticias de `reindex`: sin `info_title`.
+    assert!(results[0]["doc"].get("info_title").is_none());
 }
 
 #[tokio::test]
@@ -220,6 +222,7 @@ async fn upsert_validates_the_uid_parts_and_accepts_nulls() {
         json!({"id": "1", "tipo": ""}),
         json!({"id": " ", "tipo": "noticia"}),
         json!({"id": "c", "tipo": "a:b"}),
+        json!({"id": "x".repeat(70_000), "tipo": "noticia"}),
     ] {
         let (status, _) = send(&app, Method::POST, "/index/upsert", Some(bad)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

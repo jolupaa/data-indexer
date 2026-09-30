@@ -128,8 +128,9 @@ uid = "{tipo}:{id}"
 
 This means the pair (`tipo`, `id`) must be unique. The same `id` can exist under
 different `tipo` values without colliding. `tipo` may not contain `:` (otherwise
-two different pairs could produce the same `uid`), and neither `tipo` nor `id`
-may be empty. Leading/trailing spaces in `tipo` are trimmed.
+two different pairs could produce the same `uid`), neither `tipo` nor `id` may
+be empty, and each may be at most 1024 bytes. Leading/trailing spaces in `tipo`
+are trimmed.
 
 ### Indexed fields
 
@@ -142,7 +143,7 @@ may be empty. Leading/trailing spaces in `tipo` are trimmed.
 | `subtitulo`  | text            | yes     | yes                    | Searchable.                                      |
 | `contenido`  | text            | **no**  | yes                    | Searchable but **not returned** in results.      |
 | `fecha`      | string          | yes     | no (exact)             | Date as a string.                                |
-| `info_title` | text            | yes     | yes                    | Used by `info_doc`; optional in `/index/upsert`. |
+| `info_title` | text            | yes     | yes                    | Used by `info_doc`; omitted when empty.          |
 
 > **Important:** `contenido` is indexed for searching but is **not stored**, so it
 > will never appear in `/search` results. Only the stored fields are returned.
@@ -202,8 +203,8 @@ The request body may be up to 64 MB.
 { "ok": true }
 ```
 
-`400` if `tipo`/`id` are empty or `tipo` contains `:`; `422` if the JSON does
-not have the expected shape.
+`400` if `tipo`/`id` are empty or longer than 1024 bytes, or `tipo` contains
+`:`; `422` if the JSON does not have the expected shape.
 
 ### 4.2 `POST /index/upsert/batch`
 
@@ -292,7 +293,8 @@ An array of results, ordered by descending relevance `score`:
 
 > **Note on the `doc` shape:** Tantivy returns every stored field as an **array
 > of values** (even when there is only one value). So read `doc.titulo[0]`, not
-> `doc.titulo`. Also remember `contenido` is not stored and will be absent.
+> `doc.titulo`. Also remember `contenido` is not stored and will be absent, and
+> `info_title` is only present on documents that have one.
 
 **Error responses**
 

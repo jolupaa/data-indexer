@@ -193,16 +193,20 @@ pub async fn index_infodocs(
     while let Some(info_doc) = rows.try_next().await.context("error leyendo infoTabs")? {
         let uid = make_uid("info_doc", info_doc.id.as_str());
 
-        index_writer.add_document(doc!(
+        let mut document = doc!(
             fields.id => info_doc.id,
             fields.uid => uid,
             fields.tipo => "info_doc",
-            fields.info_title => info_doc.info_title,
             fields.titulo => info_doc.title,
             fields.subtitulo => info_doc.subtitle,
             fields.contenido => info_doc.contenido,
             fields.fecha => info_doc.created_at,
-        ))?;
+        );
+        // Igual que en `/index/upsert`: sin `info_title` si está vacío.
+        if !info_doc.info_title.is_empty() {
+            document.add_text(fields.info_title, info_doc.info_title);
+        }
+        index_writer.add_document(document)?;
         count += 1;
     }
 

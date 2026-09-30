@@ -42,19 +42,29 @@ pub struct BatchResponse {
     pub indexed: usize,
 }
 
-/// Valida el par (`tipo`, `id`) y devuelve el término de su `uid`.
-fn uid_term(fields: &SearchFields, tipo: &str, id: &str) -> Result<Term, ApiError> {
+/// Longitud máxima de `tipo` e `id`. tantivy descarta en silencio los términos
+/// de más de 64 KB, y un `uid` descartado haría el documento imposible de
+/// borrar o reemplazar (cada upsert lo duplicaría).
+const MAX_KEY_BYTES: usize = 1024;
+
+/// Valida el par (`tipo`, `id`) y devuelve su `uid`.
+fn document_uid(tipo: &str, id: &str) -> Result<String, ApiError> {
     if tipo.is_empty() || id.trim().is_empty() {
         return Err(ApiError::bad_request(
             "`tipo` e `id` no pueden estar vacíos",
         ));
+    }
+    if tipo.len() > MAX_KEY_BYTES || id.len() > MAX_KEY_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "`tipo` e `id` no pueden superar {MAX_KEY_BYTES} bytes"
+        )));
     }
     // El uid es "tipo:id". Con ':' en el tipo, dos documentos distintos podrían
     // compartirlo ("a:b" + "c" y "a" + "b:c") y un upsert borraría al otro.
     if tipo.contains(':') {
         return Err(ApiError::bad_request("`tipo` no puede contener ':'"));
     }
-    Ok(Term::from_field_text(fields.uid, &make_uid(tipo, id)))
+    Ok(make_uid(tipo, id))
 }
 
 fn build_document(
@@ -63,10 +73,10 @@ fn build_document(
 ) -> Result<(Term, TantivyDocument), ApiError> {
     // `/search` compara el filtro `tipo` ya recortado: lo guardamos igual.
     let tipo = payload.tipo.trim();
-    let term = uid_term(fields, tipo, &payload.id)?;
-    let uid = make_uid(tipo, &payload.id);
+    let uid = document_uid(tipo, &payload.id)?;
+    let term = Term::from_field_text(fields.uid, &uid);
 
-    let document = doc!(
+    let mut document = doc!(
         fields.uid => uid,
         fields.id => payload.id,
         fields.tipo => tipo,
@@ -74,8 +84,11 @@ fn build_document(
         fields.subtitulo => payload.subtitulo,
         fields.contenido => payload.contenido,
         fields.fecha => payload.fecha,
-        fields.info_title => payload.info_title,
     );
+    // Como en `reindex`: sólo los documentos que lo tienen llevan `info_title`.
+    if !payload.info_title.is_empty() {
+        document.add_text(fields.info_title, payload.info_title);
+    }
     Ok((term, document))
 }
 
@@ -133,7 +146,8 @@ pub async fn delete_document(
     State(state): State<AppState>,
     Json(payload): Json<DeleteDocumentRequest>,
 ) -> Result<Json<ApiResponse>, ApiError> {
-    let term = uid_term(&state.fields, payload.tipo.trim(), &payload.id)?;
+    let uid = document_uid(payload.tipo.trim(), &payload.id)?;
+    let term = Term::from_field_text(state.fields.uid, &uid);
 
     state
         .write(move |writer| {
