@@ -1,18 +1,35 @@
 use anyhow::Result;
-mod utils;
-mod spanish_plural;
+use std::process::ExitCode;
+
+mod error;
 mod indexer;
-
-mod searcher;
-
 mod init;
-use init::*;
-
+mod nfc;
+mod reindex;
+mod searcher;
 mod server;
-use server::*;
+mod spanish_plural;
+mod state;
+mod utils;
+
+#[cfg(test)]
+mod api_tests;
+
+use reindex::reindex;
+use server::start_server;
+
+const USAGE: &str = "\
+Uso:
+  data-indexer reindex   Reconstruye el índice desde PostgreSQL (necesita DB_URL)
+  data-indexer serve     Sirve el índice por HTTP (comando por defecto)
+
+Variables de entorno:
+  DB_URL      Cadena de conexión a PostgreSQL (sólo `reindex`)
+  INDEX_DIR   Directorio del índice (por defecto ./search_index)
+  BIND_ADDR   Dirección de escucha de `serve` (por defecto 127.0.0.1:5000)";
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
     let command = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "serve".to_string());
@@ -29,13 +46,16 @@ async fn main() -> Result<()> {
             start_server().await?;
         }
 
+        "help" | "-h" | "--help" => {
+            println!("{USAGE}");
+        }
+
         _ => {
             eprintln!("Comando no reconocido: {}", command);
-            eprintln!("Uso:");
-            eprintln!("  cargo run -- reindex");
-            eprintln!("  cargo run -- serve");
+            eprintln!("{USAGE}");
+            return Ok(ExitCode::from(2));
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }

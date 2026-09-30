@@ -1,2 +1,4 @@
 /target
 .DS_Store
+/search_index
+/search_index.reindex-*

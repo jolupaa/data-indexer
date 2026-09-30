@@ -1,46 +1,25 @@
-use anyhow::Result;
-use sqlx::PgPool;
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use tantivy::{
-    doc,
-    schema::{
-        Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING,
-    },
-    tokenizer::{
-        AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
-    },
-    Index,
+    Index, TantivyError,
+    directory::error::LockError,
+    schema::{Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions},
+    tokenizer::{AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer},
 };
 
+use crate::nfc::NfcTokenizer;
 use crate::spanish_plural::SpanishPluralFilter;
 
 /// Nombre del tokenizer que pliega acentos (á→a, ñ→n, …) además de pasar a
 /// minúsculas. Se aplica a los campos de texto buscables para que "actualizacion"
 /// encuentre "actualización". Debe registrarse en cada Index que se abra (tanto
 /// al reindexar como al servir) con `register_tokenizers`.
-pub const ES_TOKENIZER: &str = "es_folding";
-
-use crate::utils::*;
-
-
-#[derive(sqlx::FromRow)]
-struct Noticia {
-    id: String,
-    titulo: String,
-    subtitulo: String,
-    contenido: String,
-    fecha: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct InfoDoc {
-    id: String,
-    info_title: String,
-    title: String,
-    contenido: String,
-    subtitle: String,
-    created_at: String,
-}
+///
+/// El nombre queda guardado en el esquema del índice, así que lleva versión:
+/// si cambia el análisis del texto hay que subirla, y `open_index` rechazará
+/// los índices creados con el analizador anterior (sus términos ya no
+/// coincidirían con los de las consultas) hasta que se ejecute `reindex`.
+pub const ES_TOKENIZER: &str = "es_folding_v2";
 
 #[derive(Clone, Copy)]
 pub struct SearchFields {
@@ -54,6 +33,13 @@ pub struct SearchFields {
     pub fecha: Field,
 }
 
+impl SearchFields {
+    /// Campos en los que busca el texto libre de `/search`.
+    pub fn full_text(&self) -> Vec<Field> {
+        vec![self.titulo, self.subtitulo, self.info_title, self.contenido]
+    }
+}
+
 /// Opciones de un campo de texto buscable con el tokenizer que pliega acentos.
 /// `stored` controla si el valor original se devuelve en los resultados.
 fn folded_text(stored: bool) -> TextOptions {
@@ -61,16 +47,12 @@ fn folded_text(stored: bool) -> TextOptions {
         .set_tokenizer(ES_TOKENIZER)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let opts = TextOptions::default().set_indexing_options(indexing);
-    if stored {
-        opts.set_stored()
-    } else {
-        opts
-    }
+    if stored { opts.set_stored() } else { opts }
 }
 
 /// Construye el esquema del índice y devuelve los handles de cada campo.
 /// Es la única fuente de verdad del esquema: la usan tanto `reindex` (al crear
-/// el índice) como el servidor (para reconstruir los `Field` en el mismo orden).
+/// el índice) como el servidor (que comprueba que el índice en disco coincide).
 pub fn build_schema() -> (Schema, SearchFields) {
     let mut schema_builder = Schema::builder();
 
@@ -88,11 +70,11 @@ pub fn build_schema() -> (Schema, SearchFields) {
     (schema_builder.build(), fields)
 }
 
-/// Registra el tokenizer `es_folding` en el Index. Hay que llamarlo en cada
+/// Registra el tokenizer `ES_TOKENIZER` en el Index. Hay que llamarlo en cada
 /// Index recién creado o abierto, porque el analizador (a diferencia de su
 /// nombre, que sí queda en el esquema) vive sólo en memoria.
 pub fn register_tokenizers(index: &Index) {
-    let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
+    let analyzer = TextAnalyzer::builder(NfcTokenizer::new(SimpleTokenizer::default()))
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
         .filter(AsciiFoldingFilter)
@@ -101,103 +83,88 @@ pub fn register_tokenizers(index: &Index) {
     index.tokenizers().register(ES_TOKENIZER, analyzer);
 }
 
-pub async fn reindex() -> Result<()> {
-    let database_url = std::env::var("DB_URL")
-        .expect("Variable DB_URL no encontrada");
+/// Crea un índice vacío con el esquema actual y el analizador registrado.
+pub fn create_index_in(dir: &Path) -> Result<(Index, SearchFields)> {
+    let (schema, fields) = build_schema();
+    let index = Index::create_in_dir(dir, schema)
+        .with_context(|| format!("no se pudo crear el índice en {}", dir.display()))?;
+    register_tokenizers(&index);
+    Ok((index, fields))
+}
 
-    let pool = PgPool::connect(database_url.as_str()).await?;
+/// Abre el índice de `dir` comprobando que se creó con el esquema (y el
+/// analizador) de esta versión. Los `Field` se reconstruyen con
+/// `build_schema`, así que un índice con otro esquema haría que cada valor
+/// acabase en el campo equivocado: en ese caso es obligatorio reindexar.
+pub fn open_index(dir: &Path) -> Result<(Index, SearchFields)> {
+    if !dir.join("meta.json").is_file() {
+        bail!(
+            "no hay ningún índice en {}; ejecuta `reindex` primero",
+            dir.display()
+        );
+    }
+
+    let index = Index::open_in_dir(dir)
+        .with_context(|| format!("no se pudo abrir el índice en {}", dir.display()))?;
 
     let (schema, fields) = build_schema();
-
-    if Path::new("./search_index").exists() {
-        std::fs::remove_dir_all("./search_index")?;
+    if index.schema() != schema {
+        bail!(
+            "el índice en {} se creó con un esquema o analizador distinto al de esta \
+             versión; ejecuta `reindex` para regenerarlo",
+            dir.display()
+        );
     }
 
-    std::fs::create_dir_all("./search_index")?;
-
-    let index = Index::create_in_dir("./search_index", schema)?;
     register_tokenizers(&index);
-
-    let mut index_writer = index.writer(50_000_000)?;
-
-    index_noticias(&pool, &mut index_writer, fields).await?;
-    index_infodocs(&pool, &mut index_writer, fields).await?;
-
-    index_writer.commit()?;
-
-    Ok(())
+    Ok((index, fields))
 }
 
-pub async fn index_noticias(
-    pool: &PgPool,
-    index_writer: &mut tantivy::IndexWriter,
-    fields: SearchFields,
-) -> Result<()> {
-    let noticias: Vec<Noticia> = sqlx::query_as::<_, Noticia>(
-        r#"
-        SELECT 
-            id::text AS id,
-            COALESCE(titulo, '') AS titulo,
-            COALESCE(subtitulo, '') AS subtitulo,
-            COALESCE(extracted_text, '') AS contenido,
-            fecha::text AS fecha
-        FROM noticias
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
-
-    for noticia in noticias {
-        let uid = make_uid("noticia", noticia.id.as_str());
-
-        index_writer.add_document(doc!(
-            fields.id => noticia.id,
-            fields.uid => uid,
-            fields.tipo => "noticia",
-            fields.titulo => noticia.titulo,
-            fields.subtitulo => noticia.subtitulo,
-            fields.contenido => noticia.contenido,
-            fields.fecha => noticia.fecha,
-        ))?;
+/// Traduce el error de "lock ocupado" de tantivy a un mensaje accionable.
+pub fn explain_lock_error(err: TantivyError, dir: &Path) -> anyhow::Error {
+    match err {
+        TantivyError::LockFailure(LockError::LockBusy, _) => anyhow::anyhow!(
+            "el índice en {} está en uso por otro proceso (¿un `serve` o `reindex` en marcha?)",
+            dir.display()
+        ),
+        other => anyhow::Error::new(other),
     }
-
-    Ok(())
 }
 
-pub async fn index_infodocs(
-    pool: &PgPool,
-    index_writer: &mut tantivy::IndexWriter,
-    fields: SearchFields,
-) -> Result<()> {
-    let info_docs: Vec<InfoDoc> = sqlx::query_as::<_, InfoDoc>(
-        r#"
-        SELECT 
-            id::text AS id,
-            COALESCE(infotitle, '') AS info_title,
-            COALESCE(title, '') AS title,
-            COALESCE(extracted_text, '') AS contenido,
-            COALESCE(subtitle, '') AS subtitle,
-            created_at::text AS created_at
-        FROM infoTabs
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tantivy::schema::TEXT;
 
-    for info_doc in info_docs {
-        let uid = make_uid("info_doc", info_doc.id.as_str());
-
-        index_writer.add_document(doc!(
-            fields.id => info_doc.id,
-            fields.uid => uid,
-            fields.tipo => "info_doc",
-            fields.info_title => info_doc.info_title,
-            fields.titulo => info_doc.title,
-            fields.subtitulo => info_doc.subtitle,
-            fields.contenido => info_doc.contenido,
-            fields.fecha => info_doc.created_at,
-        ))?;
+    #[test]
+    fn open_index_requires_an_existing_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Err(err) = open_index(tmp.path()) else {
+            panic!("no debería abrir un directorio vacío");
+        };
+        assert!(err.to_string().contains("reindex"), "{err}");
     }
 
-    Ok(())
+    #[test]
+    fn open_index_rejects_indexes_built_with_another_schema() {
+        // Un índice de una versión anterior (otro analizador en los campos de
+        // texto) tendría términos que ya no coinciden con los de las consultas.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("titulo", TEXT | STORED);
+        Index::create_in_dir(tmp.path(), builder.build()).unwrap();
+
+        let Err(err) = open_index(tmp.path()) else {
+            panic!("no debería abrir un índice con otro esquema");
+        };
+        assert!(err.to_string().contains("reindex"), "{err}");
+    }
+
+    #[test]
+    fn open_index_accepts_indexes_built_by_this_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_index_in(tmp.path()).unwrap();
+        open_index(tmp.path()).unwrap();
+    }
 }
