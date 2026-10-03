@@ -369,11 +369,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
+ "http-body-util",
  "serde",
  "serde_json",
  "sqlx",
  "tantivy",
+ "tempfile",
  "tokio",
+ "tower",
  "unicode-normalization",
 ]
 

@@ -1,49 +1,93 @@
-use anyhow::Result;
-
+use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, State},
     routing::{delete, get, post},
-    Router,
 };
+use serde::Serialize;
 
-use std::sync::{Arc, Mutex};
-
-use tantivy::Index;
-
-use crate::indexer::{
-    AppState,
-    delete_document,
-    upsert_document,
-};
-
+use crate::indexer::{delete_document, upsert_document, upsert_documents};
+use crate::init::{explain_lock_error, open_index};
 use crate::searcher::search_documents;
-use crate::init::{build_schema, register_tokenizers};
+use crate::state::AppState;
+use crate::utils::*;
 
-pub async fn start_server() -> Result<()> {
+/// Tamaño máximo del cuerpo de los upserts. El de axum por defecto (2 MB), que
+/// se mantiene en el resto de rutas, se queda corto para el texto extraído de
+/// documentos largos, que `reindex` sí indexa sin límite.
+pub const MAX_UPSERT_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-    // El esquema en disco es el que manda; sólo necesitamos los `Field` handles,
-    // que `build_schema` reconstruye en el mismo orden que usó `reindex`.
-    let (_schema, fields) = build_schema();
-
-    let index = Index::open_in_dir("./search_index")?;
-    register_tokenizers(&index);
-
-    let index_writer = index.writer(50_000_000)?;
-
-    let state = AppState {
-        index,
-        writer: Arc::new(Mutex::new(index_writer)),
-        fields,
-    };
-
-    let app = Router::new()
-        .route("/index/upsert", post(upsert_document))
+pub fn router(state: AppState) -> Router {
+    let upsert_limit = DefaultBodyLimit::max(MAX_UPSERT_BODY_BYTES);
+    Router::new()
+        .route("/health", get(health))
+        .route("/index/upsert", post(upsert_document).layer(upsert_limit))
+        .route(
+            "/index/upsert/batch",
+            post(upsert_documents).layer(upsert_limit),
+        )
         .route("/index/delete", delete(delete_document))
         .route("/search", get(search_documents))
-        .with_state(state);
+        .with_state(state)
+}
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:5000").await?;
+pub async fn start_server() -> Result<()> {
+    let dir = index_dir();
+    let (index, fields) = open_index(&dir)?;
+    let state = AppState::new(index, fields).map_err(|err| explain_lock_error(err, &dir))?;
 
-    axum::serve(listener, app).await?;
+    let addr = bind_addr();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("no se pudo escuchar en {addr}"))?;
+    println!(
+        "Sirviendo {} en http://{}",
+        dir.display(),
+        listener.local_addr()?
+    );
 
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    println!("Servidor detenido.");
     Ok(())
+}
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub ok: bool,
+    pub docs: u64,
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        ok: true,
+        docs: state.reader.searcher().num_docs(),
+    })
+}
+
+/// Espera a Ctrl+C o SIGTERM para cerrar ordenadamente: se terminan las
+/// peticiones en curso (y sus commits) antes de salir.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
