@@ -322,3 +322,83 @@ async fn deeply_nested_queries_do_not_hang_the_server() {
     let (status, _) = send(&app, Method::GET, &format!("/search?{too_long}"), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn upsert_rejects_invalid_acl_and_thread() {
+    let app = test_app();
+    let too_many: Vec<String> = (0..33).map(|i| format!("u:{i}")).collect();
+    for bad in [
+        json!({"id": "1", "tipo": "chat_msg", "acl": [""]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": ["x".repeat(257)]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": ["u:a b"]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": ["u:a,b"]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": too_many}),
+        json!({"id": "1", "tipo": "chat_msg", "thread": "   "}),
+        json!({"id": "1", "tipo": "chat_msg", "thread": "t".repeat(1025)}),
+    ] {
+        let (status, body) = send(&app, Method::POST, "/index/upsert", Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+
+    // `acl` es una lista de strings, no un string.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/index/upsert",
+        Some(json!({"id": "1", "tipo": "chat_msg", "acl": "u:1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 32 valores de 256 bytes justos sí valen.
+    let at_the_limit: Vec<String> = (0..32)
+        .map(|i| format!("u:{i:02}{}", "x".repeat(252)))
+        .collect();
+    upsert(
+        &app,
+        json!({"id": "2", "tipo": "chat_msg", "acl": at_the_limit}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn batch_names_the_item_with_an_invalid_acl() {
+    let app = test_app();
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/index/upsert/batch",
+        Some(json!([
+            {"id": "1", "tipo": "chat_msg", "acl": ["u:1"], "contenido": "lote"},
+            {"id": "2", "tipo": "chat_msg", "acl": ["u:1 "], "contenido": "lote"},
+        ])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.starts_with("[1]: "), "{body}");
+}
+
+#[tokio::test]
+async fn results_carry_thread_but_never_acl() {
+    let app = test_app();
+    // Sin `acl` es público, así que la búsqueda por defecto lo encuentra.
+    upsert(
+        &app,
+        json!({
+            "id": "7101",
+            "tipo": "chat_msg",
+            "thread": "dev-thread-maria",
+            "contenido": "calendario",
+        }),
+    )
+    .await;
+    let results = search(&app, "q=calendario").await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["doc"]["thread"], json!(["dev-thread-maria"]));
+    assert!(results[0]["doc"].get("acl").is_none());
+
+    upsert(&app, noticia("1", "sin hilo")).await;
+    let results = search(&app, "q=hilo").await;
+    assert_eq!(results.len(), 1);
+    assert!(results[0]["doc"].get("thread").is_none());
+}

@@ -170,11 +170,28 @@ are trimmed.
 | `contenido`  | text            | **no**  | yes                    | Searchable but **not returned** in results.      |
 | `fecha`      | string          | yes     | no (exact)             | Date as a string.                                |
 | `info_title` | text            | yes     | yes                    | Used by `info_doc`; omitted when empty.          |
+| `acl`        | string (list)   | **no**  | no (exact)             | Who may see it; `public` if not sent. Never returned. |
+| `thread`     | string          | yes     | no (exact)             | Conversation of a `chat_msg`; omitted when empty. |
 
 > **Important:** `contenido` is indexed for searching but is **not stored**, so it
 > will never appear in `/search` results. Only the stored fields are returned.
 
 Full-text search runs over `titulo`, `subtitulo`, `info_title`, and `contenido`.
+
+### Access control
+
+Every document carries one or more *principals* in `acl`. The indexer treats
+them as opaque strings; the GVinfo backend uses these:
+
+| Principal      | Meaning                                         |
+| -------------- | ----------------------------------------------- |
+| `public`       | Anyone. Implicit when a document has no `acl`.  |
+| `u:<users.id>` | The employee who owns a chat conversation.      |
+| `a:<users.id>` | The admin assigned to a chat conversation.      |
+
+A principal is 1–256 bytes without whitespace or commas, and is matched
+exactly: case-sensitive, never analysed, never a prefix of another one. `acl`
+is indexed but not stored, so it is never returned.
 
 ### Text analysis
 
@@ -215,11 +232,34 @@ repeatedly with the same `tipo`+`id` is safe (idempotent upsert).
 }
 ```
 
+A private chat message, visible to its employee and its admin:
+
+```json
+{
+  "id": "7101",
+  "tipo": "chat_msg",
+  "thread": "dev-thread-maria",
+  "contenido": "Te paso el calendario de turnos",
+  "fecha": "2026-10-03T08:42:00.000Z",
+  "acl": ["u:usr-emp-001", "a:usr-admin-001"]
+}
+```
+
 `id` and `tipo` are **required strings**. `titulo`, `subtitulo`, `contenido`,
-`fecha` and `info_title` are optional strings: missing or `null` means `""`.
-(If your source values are numbers or dates, convert them to strings before
-sending.) Upserting always replaces the whole document, so send every field you
-want to keep — including `info_title` for `info_doc` documents.
+`fecha`, `info_title` and `thread` are optional strings: missing or `null`
+means `""`. (If your source values are numbers or dates, convert them to
+strings before sending.) Upserting always replaces the whole document, so send
+every field you want to keep — including `info_title` for `info_doc` documents
+and `acl` for private ones (re-sending a document with another `acl` replaces
+its principals, e.g. when a conversation is reassigned).
+
+- `acl` (optional list of strings): who may see the document, see
+  [Access control](#access-control). Missing, `null` or `[]` means
+  `["public"]`. At most 32 values, each 1–256 bytes, without whitespace or
+  commas.
+- `thread` (optional string): the conversation a `chat_msg` belongs to.
+  Stored, returned in results and compared exactly (never trimmed); it may not
+  be blank or longer than 1024 bytes.
 
 The request body may be up to 64 MB (the other routes keep the default 2 MB).
 
@@ -229,8 +269,9 @@ The request body may be up to 64 MB (the other routes keep the default 2 MB).
 { "ok": true }
 ```
 
-`400` if `tipo`/`id` are empty or longer than 1024 bytes, or `tipo` contains
-`:`; `422` if the JSON does not have the expected shape.
+`400` if `tipo`/`id` are empty or longer than 1024 bytes, `tipo` contains
+`:`, or `acl`/`thread` break the rules above; `422` if the JSON does not have
+the expected shape (e.g. `acl` is a string instead of a list).
 
 ### 4.2 `POST /index/upsert/batch`
 
@@ -320,8 +361,9 @@ An array of results, ordered by descending relevance `score`:
 
 > **Note on the `doc` shape:** Tantivy returns every stored field as an **array
 > of values** (even when there is only one value). So read `doc.titulo[0]`, not
-> `doc.titulo`. Also remember `contenido` is not stored and will be absent, and
-> `info_title` is only present on documents that have one.
+> `doc.titulo`. Also remember `contenido` is not stored and will be absent,
+> `info_title` and `thread` are only present on documents that have one, and
+> `acl` is never returned.
 
 **Error responses**
 
@@ -357,7 +399,7 @@ const BASE_URL = process.env.INDEXER_URL || "http://127.0.0.1:5000";
 
 /**
  * Insert or update a document in the search index.
- * @param {{id:string,tipo:string,titulo?:string,subtitulo?:string,contenido?:string,fecha?:string,info_title?:string}} doc
+ * @param {{id:string,tipo:string,titulo?:string,subtitulo?:string,contenido?:string,fecha?:string,info_title?:string,thread?:string,acl?:string[]}} doc
  */
 export async function upsertDocument(doc) {
   const res = await fetch(`${BASE_URL}/index/upsert`, {
@@ -371,6 +413,8 @@ export async function upsertDocument(doc) {
       contenido: String(doc.contenido ?? ""),
       fecha: String(doc.fecha ?? ""),
       info_title: String(doc.info_title ?? ""),
+      thread: String(doc.thread ?? ""),
+      acl: (doc.acl ?? []).map(String), // [] = public
     }),
   });
 
@@ -397,6 +441,8 @@ export async function upsertDocuments(docs) {
         contenido: String(doc.contenido ?? ""),
         fecha: String(doc.fecha ?? ""),
         info_title: String(doc.info_title ?? ""),
+        thread: String(doc.thread ?? ""),
+        acl: (doc.acl ?? []).map(String), // [] = public
       })),
     ),
   });

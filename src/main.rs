@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::process::ExitCode;
 
+mod acl;
 mod error;
 mod indexer;
 mod init;

@@ -7,7 +7,7 @@ use tantivy::{
     directory::{Directory, INDEX_WRITER_LOCK, MmapDirectory},
 };
 
-use crate::indexer::{IndexDocumentRequest, document_uid, into_document};
+use crate::indexer::{IndexDocumentRequest, build_document};
 use crate::init::{
     IndexStatus, REBUILD_MARKER, SearchFields, WRITER_MEMORY_BYTES, create_index_in,
     explain_lock_error, inspect_index,
@@ -224,26 +224,23 @@ fn recreate_index(dir: &Path) -> Result<(Index, SearchFields)> {
     create_index_in(dir)
 }
 
-/// Añade una fila al índice con las mismas funciones que usa `/index/upsert`,
-/// para que el documento tenga la misma forma venga por donde venga. Las filas
-/// que no pasan la validación se omiten con un aviso.
+/// Añade una fila al índice con la misma validación y la misma construcción
+/// que `/index/upsert` (`build_document`), para que el documento tenga la
+/// misma forma venga por donde venga. Las filas que la API rechazaría se
+/// omiten con un aviso.
 fn index_row(
     index_writer: &IndexWriter,
     fields: SearchFields,
     request: IndexDocumentRequest,
 ) -> Result<bool> {
-    match document_uid(&request.tipo, &request.id) {
-        Ok(uid) => {
-            let (_, document) = into_document(&fields, request, uid);
+    let label = format!("{}:{}", preview(&request.tipo), preview(&request.id));
+    match build_document(&fields, request) {
+        Ok((_, document)) => {
             index_writer.add_document(document)?;
             Ok(true)
         }
         Err(err) => {
-            eprintln!(
-                "Aviso: se omite {}:{}: {err}",
-                preview(&request.tipo),
-                preview(&request.id)
-            );
+            eprintln!("Aviso: se omite {label}: {err}");
             Ok(false)
         }
     }
@@ -285,7 +282,7 @@ pub async fn index_noticias(
             subtitulo: noticia.subtitulo,
             contenido: noticia.contenido,
             fecha: noticia.fecha,
-            info_title: String::new(),
+            ..Default::default()
         };
         if index_row(index_writer, fields, request)? {
             count += 1;
@@ -324,6 +321,7 @@ pub async fn index_infodocs(
             contenido: info_doc.contenido,
             fecha: info_doc.created_at,
             info_title: info_doc.info_title,
+            ..Default::default()
         };
         if index_row(index_writer, fields, request)? {
             count += 1;
@@ -564,6 +562,23 @@ mod tests {
         };
         assert!(err.to_string().contains("no es de data-indexer"), "{err}");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), files_before);
+    }
+
+    #[test]
+    fn index_row_skips_rows_the_api_would_reject() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (writer, fields) = open_for_rebuild(tmp.path()).unwrap();
+        let row = |id: &str, acl: &[&str]| IndexDocumentRequest {
+            id: id.to_string(),
+            tipo: "chat_msg".to_string(),
+            acl: acl.iter().map(|value| value.to_string()).collect(),
+            ..Default::default()
+        };
+
+        assert!(!index_row(&writer, fields, row("1", &["u:con espacio"])).unwrap());
+        assert!(index_row(&writer, fields, row("2", &["u:usr-emp-001"])).unwrap());
+        finish_rebuild(tmp.path(), writer).unwrap();
+        assert_eq!(num_docs(tmp.path()), 1);
     }
 
     #[test]

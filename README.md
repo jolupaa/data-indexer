@@ -108,7 +108,8 @@ fields are array-valued and `contenido` is searchable but not returned).
 - The server binds to `127.0.0.1` by default and has **no authentication** —
   keep it behind your backend or a proxy.
 - `serve` requires that `reindex` has been run at least once.
-- All document fields are strings.
+- All document fields are strings, except `acl`, a list of strings; a
+  document without `acl` is public.
 - `limit` is capped at 1000, `offset` at 10000 and `q` at 1000 characters.
 
 ## License
