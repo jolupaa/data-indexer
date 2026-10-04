@@ -18,6 +18,8 @@ and search documents — designed to sit behind a Node.js (or any) backend.
 - Per-document access control: each document lists who may see it in `acl`
   (`public` when omitted) and `/search` only returns what its `acl`
   principals may see.
+- Search-as-you-type: with `prefix=true` the last word also matches as a
+  prefix (`nomi` finds `Nómina`).
 - Idempotent upsert keyed by a composite `uid` (`tipo:id`), single or batched.
 - Safe bulk `reindex` straight from PostgreSQL: the rebuild is applied in a
   single commit, so a failure half-way leaves the previous index intact.
@@ -67,7 +69,7 @@ cargo run --release -- serve
 | `POST`   | `/index/upsert`       | Insert or replace a document.                   |
 | `POST`   | `/index/upsert/batch` | Insert or replace many documents in one commit. |
 | `DELETE` | `/index/delete`       | Delete a document by `tipo` + `id`.             |
-| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=&acl=`). |
+| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=&acl=&prefix=`). |
 | `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.    |
 
 ### Example

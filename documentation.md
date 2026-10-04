@@ -328,11 +328,13 @@ Runs a full-text query and returns the top matching documents, scored.
 | `limit`  | no       | `10`    | Maximum number of results to return. Values above `1000` are capped; `0` returns `[]`. |
 | `offset` | no       | `0`     | Number of top results to skip, for pagination (max `10000`).                          |
 | `acl`    | no       | `public` | Comma-separated principals (`u:usr-1,a:usr-1`, at most 64). Only documents that share at least one are returned; see [Access control](#access-control). |
+| `prefix` | no       | `false` | `true` also matches the last word of `q` as a prefix (see *Prefix matching* below).   |
 
 Example:
 
 ```
 GET /search?q=elecciones&tipo=noticia&limit=5&offset=10
+GET /search?q=turnos%20de%20oct&tipo=chat_msg&acl=u:usr-emp-001&prefix=true
 ```
 
 **Query syntax.** `q` accepts Tantivy's query syntax: several words match
@@ -345,6 +347,15 @@ singular/plural don't matter.
 If `q` is not valid syntax — e.g. `12:30`, a URL, or an unclosed quote — or
 nests parentheses more than 8 levels deep, it is searched as plain words
 instead of failing.
+
+**Prefix matching.** With `prefix=true`, the last word of `q` — after the same
+analysis as the index: lowercase, no accents, singular — also matches as a
+prefix in `titulo`, `subtitulo`, `info_title` and `contenido`, as long as it
+has at least 3 characters: `nomi` finds "Nómina", `NÓMI` too. The expansion is
+capped at 200 index terms per field and segment. Each field that matches by
+prefix adds 1.0 to the score and a whole word also scores as usual, so exact
+matches rank first. The prefix is an alternative to `q`, so an exclusion such
+as `-x` in `q` does not apply to it; `acl` and `tipo` always do.
 
 **Response** — `200 OK`
 
@@ -376,7 +387,7 @@ An array of results, ordered by descending relevance `score`:
 
 | Status | When                                                                       |
 | ------ | -------------------------------------------------------------------------- |
-| `400`  | Missing `q`, `q` longer than 1000 characters, invalid `limit`/`offset`, an invalid `acl` (an empty value, whitespace, a value over 256 bytes or more than 64 values) or a repeated parameter. |
+| `400`  | Missing `q`, `q` longer than 1000 characters, invalid `limit`/`offset`, a `prefix` other than `true`/`false`, an invalid `acl` (an empty value, whitespace, a value over 256 bytes or more than 64 values) or a repeated parameter. |
 | `500`  | Internal error (index read or search failure).                             |
 
 The body of an error is a plain-text message, not JSON. For `500` it is always
@@ -481,7 +492,7 @@ export async function deleteDocument(tipo, id) {
 /**
  * Search the index.
  * @param {string} q       query string
- * @param {{tipo?:string, limit?:number, offset?:number, acl?:string[]}} [opts]
+ * @param {{tipo?:string, limit?:number, offset?:number, acl?:string[], prefix?:boolean}} [opts]
  * @returns {Promise<Array<{score:number, doc:object}>>}
  */
 export async function search(q, opts = {}) {
@@ -490,6 +501,7 @@ export async function search(q, opts = {}) {
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.offset) params.set("offset", String(opts.offset));
   if (opts.acl) params.set("acl", opts.acl.join(",")); // default: public
+  if (opts.prefix) params.set("prefix", "true"); // search-as-you-type
 
   const res = await fetch(`${BASE_URL}/search?${params.toString()}`);
 

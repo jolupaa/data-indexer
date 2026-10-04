@@ -7,16 +7,17 @@ use tantivy::{
     Document, TantivyDocument, Term,
     collector::TopDocs,
     query::{
-        BooleanQuery, ConstScoreQuery, Occur, Query as TantivyQuery, QueryParser, TermQuery,
-        TermSetQuery,
+        BooleanQuery, ConstScoreQuery, Occur, PhrasePrefixQuery, Query as TantivyQuery,
+        QueryParser, TermQuery, TermSetQuery,
     },
     schema::{IndexRecordOption, NamedFieldDocument},
+    tokenizer::TokenStream,
 };
 use unicode_normalization::UnicodeNormalization;
 
 use crate::acl::search_principals;
 use crate::error::ApiError;
-use crate::init::SearchFields;
+use crate::init::{SearchFields, es_analyzer};
 use crate::state::AppState;
 
 pub const DEFAULT_LIMIT: usize = 10;
@@ -33,6 +34,12 @@ pub const MAX_QUERY_CHARS: usize = 1_000;
 /// ya cuestan ~1 s de CPU y 30, días), así que una consulta como "((((…a" de
 /// pocas decenas de caracteres bastaba para bloquear el servidor.
 const MAX_QUERY_NESTING: usize = 8;
+/// Longitud mínima, en caracteres y ya analizado, del término que
+/// `prefix=true` expande: "a" o "de" expandirían a medio índice.
+pub const MIN_PREFIX_CHARS: usize = 3;
+/// Máximo de términos del índice en los que se expande el prefijo, por campo y
+/// segmento: acota el coste de un prefijo corto y corriente.
+pub const PREFIX_MAX_EXPANSIONS: u32 = 200;
 
 #[derive(Deserialize)]
 pub struct SearchParams {
@@ -42,6 +49,9 @@ pub struct SearchParams {
     pub offset: Option<usize>,
     /// Principales separados por comas (`u:1,a:1`). Sin él, `public`.
     pub acl: Option<String>,
+    /// `true`: la última palabra de `q` casa también como prefijo ("nomi" →
+    /// "nómina"), para buscar mientras se escribe. Por defecto `false`.
+    pub prefix: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -78,6 +88,7 @@ pub async fn search_documents(
             &params.q,
             params.tipo.as_deref(),
             &principals,
+            params.prefix.unwrap_or(false),
             limit,
             offset,
         )
@@ -94,10 +105,15 @@ fn run_search(
     q: &str,
     tipo: Option<&str>,
     principals: &[String],
+    prefix: bool,
     limit: usize,
     offset: usize,
 ) -> tantivy::Result<Vec<SearchResult>> {
-    let final_query = restrict_to(&state.fields, principals, base_query(state, q, tipo));
+    let final_query = restrict_to(
+        &state.fields,
+        principals,
+        base_query(state, q, tipo, prefix),
+    );
 
     let searcher = state.reader.searcher();
     let top_docs = searcher.search(
@@ -118,9 +134,18 @@ fn run_search(
         .collect()
 }
 
-/// La consulta de v2: el texto de `q` y, si se pide, el filtro por `tipo`.
-fn base_query(state: &AppState, q: &str, tipo: Option<&str>) -> Box<dyn TantivyQuery> {
-    let text_query = parse_user_query(&state.query_parser, q);
+/// La consulta de v2 —el texto de `q` y, si se pide, el filtro por `tipo`—,
+/// con el prefijo de `prefix=true` como alternativa al texto.
+fn base_query(
+    state: &AppState,
+    q: &str,
+    tipo: Option<&str>,
+    prefix: bool,
+) -> Box<dyn TantivyQuery> {
+    let mut text_query = parse_user_query(&state.query_parser, q);
+    if prefix {
+        text_query = with_prefix(&state.fields, text_query, q);
+    }
 
     match tipo.map(str::trim) {
         Some(tipo_doc) if !tipo_doc.is_empty() => {
@@ -137,6 +162,44 @@ fn base_query(state: &AppState, q: &str, tipo: Option<&str>) -> Box<dyn TantivyQ
 
         _ => text_query,
     }
+}
+
+/// Añade a `text_query`, como alternativa (`Should`), la última palabra de `q`
+/// como prefijo en cada campo de texto. Cada campo que casa por prefijo suma
+/// 1.0, y una palabra entera casa además por el texto, así que lo exacto queda
+/// por delante. Sin un término de al menos `MIN_PREFIX_CHARS` caracteres
+/// devuelve `text_query` tal cual.
+fn with_prefix(
+    fields: &SearchFields,
+    text_query: Box<dyn TantivyQuery>,
+    q: &str,
+) -> Box<dyn TantivyQuery> {
+    let Some(prefix) = last_prefix_term(q) else {
+        return text_query;
+    };
+    let mut clauses = vec![(Occur::Should, text_query)];
+    for field in fields.full_text() {
+        let mut query = PhrasePrefixQuery::new(vec![Term::from_field_text(field, &prefix)]);
+        query.set_max_expansions(PREFIX_MAX_EXPANSIONS);
+        clauses.push((Occur::Should, Box::new(query)));
+    }
+    Box::new(BooleanQuery::new(clauses))
+}
+
+/// La última palabra de `q` tal y como queda tras el analizador del índice
+/// (minúsculas, sin tildes, en singular), si tiene al menos
+/// `MIN_PREFIX_CHARS` caracteres. Se toma de `plain_text(q)`, así que la
+/// sintaxis de consulta (`"`, `-`, `campo:`) no cuenta como palabra.
+fn last_prefix_term(q: &str) -> Option<String> {
+    let plain = plain_text(q);
+    let last_word = plain.split_whitespace().last()?;
+    let mut analyzer = es_analyzer();
+    let mut stream = analyzer.token_stream(last_word);
+    let mut term = None;
+    while stream.advance() {
+        term = Some(stream.token().text.clone());
+    }
+    term.filter(|term| term.chars().count() >= MIN_PREFIX_CHARS)
 }
 
 /// Deja en `query` sólo los documentos que comparten algún principal con
@@ -207,4 +270,36 @@ fn plain_text(q: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prefix_is_the_last_word_analysed_like_the_index() {
+        assert_eq!(last_prefix_term("nomi").as_deref(), Some("nomi"));
+        assert_eq!(last_prefix_term("calendario TUR").as_deref(), Some("tur"));
+        assert_eq!(last_prefix_term("Nóminas").as_deref(), Some("nomina"));
+        assert_eq!(last_prefix_term("No\u{301}mi").as_deref(), Some("nomi"));
+        assert_eq!(last_prefix_term("nomi   ").as_deref(), Some("nomi"));
+        assert_eq!(last_prefix_term("\"turnos de oct").as_deref(), Some("oct"));
+        assert_eq!(last_prefix_term("tipo:chat_msg").as_deref(), Some("msg"));
+    }
+
+    #[test]
+    fn short_or_missing_words_have_no_prefix() {
+        for q in [
+            "",
+            "   ",
+            "no",
+            "turnos de",
+            "*",
+            "-",
+            "¿?",
+            &"a".repeat(41),
+        ] {
+            assert_eq!(last_prefix_term(q), None, "{q:?}");
+        }
+    }
 }

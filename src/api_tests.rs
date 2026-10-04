@@ -668,3 +668,93 @@ async fn principals_match_exactly() {
         assert!(search(&app, &uri).await.is_empty(), "{uri}");
     }
 }
+
+#[tokio::test]
+async fn prefix_expands_only_the_last_word() {
+    let app = test_app();
+    upsert(&app, noticia("1", "Nómina de septiembre")).await;
+    upsert(&app, noticia("2", "Recibo de nóminas pendientes")).await;
+
+    // Sin `prefix`, como en v2: una palabra a medias no casa.
+    assert!(search(&app, "q=nomi").await.is_empty());
+    assert!(search(&app, "q=nomi&prefix=false").await.is_empty());
+
+    assert_eq!(ids(&search(&app, "q=nomi&prefix=true").await), ["1", "2"]);
+    assert_eq!(ids(&search(&app, "q=septiem&prefix=true").await), ["1"]);
+    // Sólo la última palabra es un prefijo: "nomi" no casa como palabra.
+    assert_eq!(ids(&search(&app, "q=nomi%20sept&prefix=true").await), ["1"]);
+    // Con menos de 3 caracteres no se expande.
+    assert!(search(&app, "q=no&prefix=true").await.is_empty());
+
+    let (status, _) = send(&app, Method::GET, "/search?q=nomi&prefix=si", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn exact_matches_rank_above_prefix_only_matches() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(&app, noticia("2", "turn")).await;
+
+    let results = search(&app, "q=turn&prefix=true").await;
+    assert_eq!(ids(&results), ["1", "2"]);
+    assert_eq!(results[0]["doc"]["id"], json!(["2"]));
+}
+
+#[tokio::test]
+async fn prefix_matches_respect_acl_and_tipo() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(
+        &app,
+        chat("7101", "t1", "turnos de octubre", &["u:usr-ana"]),
+    )
+    .await;
+
+    assert_eq!(ids(&search(&app, "q=tur&prefix=true").await), ["1"]);
+    assert_eq!(
+        ids(&search(&app, "q=tur&prefix=true&acl=u:usr-ana").await),
+        ["7101"]
+    );
+    assert!(
+        search(&app, "q=tur&prefix=true&acl=u:usr-bob")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        ids(&search(&app, "q=tur&prefix=true&acl=u:usr-ana,public&tipo=noticia").await),
+        ["1"]
+    );
+}
+
+#[tokio::test]
+async fn prefix_ignores_case_accents_and_a_trailing_space() {
+    let app = test_app();
+    upsert(&app, noticia("1", "Nómina de septiembre")).await;
+
+    for q in [
+        "NOMI",
+        "N%C3%B3mi",  // "Nómi"
+        "No%CC%81mi", // "Nómi" en NFD
+        "nomi%20",    // espacio al final
+        "N%C3%93MINAS",
+        "%22nomi", // comillas sin cerrar
+    ] {
+        let uri = format!("q={q}&prefix=true");
+        assert_eq!(ids(&search(&app, &uri).await), ["1"], "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn prefix_with_nothing_to_expand_returns_nothing() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(&app, chat("7101", "t1", "turnos", &["u:usr-ana"])).await;
+
+    for q in ["", "%20%20", "%22", "-", "%3A%3A", "tu", "%C2%BF%3F"] {
+        for acl in ["", "&acl=u:usr-ana"] {
+            let uri = format!("q={q}&prefix=true{acl}");
+            assert!(search(&app, &uri).await.is_empty(), "{uri}");
+        }
+    }
+}
