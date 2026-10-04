@@ -69,6 +69,8 @@ cargo run --release -- serve
 | `POST`   | `/index/upsert`       | Insert or replace a document.                   |
 | `POST`   | `/index/upsert/batch` | Insert or replace many documents in one commit. |
 | `DELETE` | `/index/delete`       | Delete a document by `tipo` + `id`.             |
+| `DELETE` | `/index/delete/thread` | Delete every document of a conversation.       |
+| `DELETE` | `/index/delete/tipo`  | Delete every document of a `tipo`.              |
 | `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=&acl=&prefix=`). |
 | `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.    |
 

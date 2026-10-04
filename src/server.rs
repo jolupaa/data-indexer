@@ -6,7 +6,9 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::indexer::{delete_document, upsert_document, upsert_documents};
+use crate::indexer::{
+    delete_document, delete_thread, delete_tipo, upsert_document, upsert_documents,
+};
 use crate::init::{explain_lock_error, open_index};
 use crate::searcher::search_documents;
 use crate::state::AppState;
@@ -27,6 +29,8 @@ pub fn router(state: AppState) -> Router {
             post(upsert_documents).layer(upsert_limit),
         )
         .route("/index/delete", delete(delete_document))
+        .route("/index/delete/thread", delete(delete_thread))
+        .route("/index/delete/tipo", delete(delete_tipo))
         .route("/search", get(search_documents))
         .with_state(state)
 }

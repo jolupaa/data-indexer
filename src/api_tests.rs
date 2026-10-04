@@ -758,3 +758,107 @@ async fn prefix_with_nothing_to_expand_returns_nothing() {
         }
     }
 }
+
+#[tokio::test]
+async fn delete_thread_removes_the_whole_conversation() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    for (id, thread) in [("7101", "t-ana"), ("7102", "t-ana"), ("7201", "t-bob")] {
+        upsert(
+            &app,
+            chat(id, thread, "turnos", &["u:usr-ana", "u:usr-bob"]),
+        )
+        .await;
+    }
+    let everything = "q=turnos&acl=u:usr-ana,u:usr-bob,public";
+
+    let (status, body) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete/thread",
+        Some(json!({"thread": "t-ana"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, r#"{"ok":true}"#);
+    assert_eq!(ids(&search(&app, everything).await), ["1", "7201"]);
+
+    // Una conversación que no existe no es un error, y el thread se compara
+    // tal cual: " t-bob " no es "t-bob".
+    for thread in ["no-existe", " t-bob "] {
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            "/index/delete/thread",
+            Some(json!({ "thread": thread })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(ids(&search(&app, everything).await), ["1", "7201"]);
+}
+
+#[tokio::test]
+async fn delete_tipo_removes_a_whole_corpus() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(
+        &app,
+        json!({"id": "1", "tipo": "info_doc", "titulo": "turnos"}),
+    )
+    .await;
+    upsert(&app, chat("7101", "t-ana", "turnos", &["u:usr-ana"])).await;
+    upsert(&app, chat("7201", "t-bob", "turnos", &["u:usr-bob"])).await;
+
+    // El tipo se recorta, como al indexar.
+    let (status, body) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete/tipo",
+        Some(json!({"tipo": " chat_msg "})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, r#"{"ok":true}"#);
+
+    let results = search(&app, "q=turnos&acl=u:usr-ana,u:usr-bob,public").await;
+    let mut tipos: Vec<&str> = results
+        .iter()
+        .map(|r| r["doc"]["tipo"][0].as_str().unwrap())
+        .collect();
+    tipos.sort();
+    assert_eq!(tipos, ["info_doc", "noticia"]);
+}
+
+#[tokio::test]
+async fn deletes_by_thread_and_tipo_validate_their_input() {
+    let app = test_app();
+    for (uri, bad) in [
+        ("/index/delete/thread", json!({"thread": ""})),
+        ("/index/delete/thread", json!({"thread": "   "})),
+        ("/index/delete/thread", json!({"thread": "t".repeat(1025)})),
+        ("/index/delete/tipo", json!({"tipo": ""})),
+        ("/index/delete/tipo", json!({"tipo": "   "})),
+        ("/index/delete/tipo", json!({"tipo": "a:b"})),
+        ("/index/delete/tipo", json!({"tipo": "t".repeat(1025)})),
+    ] {
+        let (status, body) = send(&app, Method::DELETE, uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {bad}: {body}");
+    }
+    for (uri, bad) in [
+        ("/index/delete/thread", json!({})),
+        ("/index/delete/thread", json!({"thread": 7})),
+        ("/index/delete/tipo", json!({"thread": "t-ana"})),
+    ] {
+        let (status, _) = send(&app, Method::DELETE, uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri} {bad}");
+    }
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/index/delete/thread",
+        Some(json!({"thread": "t-ana"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}

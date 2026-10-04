@@ -80,6 +80,23 @@ pub fn document_uid(tipo: &str, id: &str) -> Result<String, ApiError> {
     Ok(make_uid(tipo, id))
 }
 
+/// Valida un `tipo` ya recortado con las mismas reglas que el de un documento:
+/// ni vacío, ni más largo que `MAX_KEY_BYTES`, ni con `:`.
+pub fn check_tipo(tipo: &str) -> Result<(), ApiError> {
+    if tipo.is_empty() {
+        return Err(ApiError::bad_request("`tipo` no puede estar vacío"));
+    }
+    if tipo.len() > MAX_KEY_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "`tipo` no puede superar {MAX_KEY_BYTES} bytes"
+        )));
+    }
+    if tipo.contains(':') {
+        return Err(ApiError::bad_request("`tipo` no puede contener ':'"));
+    }
+    Ok(())
+}
+
 /// Valida el identificador de una conversación: ni en blanco ni más largo que
 /// `MAX_KEY_BYTES` (un término descartado por tantivy haría la conversación
 /// imposible de borrar con `/index/delete/thread`). No se recorta: se guarda y
@@ -216,6 +233,55 @@ pub async fn delete_document(
     Ok(Json(ApiResponse { ok: true }))
 }
 
+#[derive(Deserialize)]
+pub struct DeleteThreadRequest {
+    pub thread: String,
+}
+
+/// Borra todos los documentos de una conversación. Como `/index/delete`, no es
+/// un error que no haya ninguno.
+pub async fn delete_thread(
+    State(state): State<AppState>,
+    Json(payload): Json<DeleteThreadRequest>,
+) -> Result<Json<ApiResponse>, ApiError> {
+    check_thread(&payload.thread)?;
+    let term = Term::from_field_text(state.fields.thread, &payload.thread);
+
+    state
+        .write(move |writer| {
+            writer.delete_term(term);
+            Ok(())
+        })
+        .await?;
+
+    Ok(Json(ApiResponse { ok: true }))
+}
+
+#[derive(Deserialize)]
+pub struct DeleteTipoRequest {
+    pub tipo: String,
+}
+
+/// Borra un corpus entero, todos los documentos de un `tipo`, para que el
+/// backend lo vuelva a sembrar. El `tipo` se recorta, como al indexar.
+pub async fn delete_tipo(
+    State(state): State<AppState>,
+    Json(payload): Json<DeleteTipoRequest>,
+) -> Result<Json<ApiResponse>, ApiError> {
+    let tipo = payload.tipo.trim();
+    check_tipo(tipo)?;
+    let term = Term::from_field_text(state.fields.tipo, tipo);
+
+    state
+        .write(move |writer| {
+            writer.delete_term(term);
+            Ok(())
+        })
+        .await?;
+
+    Ok(Json(ApiResponse { ok: true }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +332,15 @@ mod tests {
             ["u:usr-emp-001", "a:usr-admin-001"]
         );
         assert_eq!(texts(&document, fields.thread), ["dev-thread-maria"]);
+    }
+
+    #[test]
+    fn tipo_follows_the_document_rules() {
+        check_tipo("chat_msg").unwrap();
+        check_tipo(&"t".repeat(MAX_KEY_BYTES)).unwrap();
+        for bad in ["", "a:b", &"t".repeat(MAX_KEY_BYTES + 1)] {
+            assert!(check_tipo(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

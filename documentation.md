@@ -402,6 +402,47 @@ Returns `200 OK` with the number of documents currently searchable:
 { "ok": true, "docs": 1234 }
 ```
 
+### 4.6 `DELETE /index/delete/thread`
+
+Removes every document of a conversation: all documents whose `thread` is
+exactly the given value.
+
+**Request body**
+
+```json
+{ "thread": "dev-thread-maria" }
+```
+
+**Response** — `200 OK`, also when no document matched:
+
+```json
+{ "ok": true }
+```
+
+`400` if `thread` is blank or longer than 1024 bytes; `422` if the body has no
+`thread` string.
+
+### 4.7 `DELETE /index/delete/tipo`
+
+Removes a whole corpus — every document of one `tipo` — so a client can load
+it again from scratch (e.g. `{"tipo": "chat_msg"}` before re-sending every
+chat message). `tipo` is trimmed, as on upsert.
+
+**Request body**
+
+```json
+{ "tipo": "chat_msg" }
+```
+
+**Response** — `200 OK`, also when no document matched:
+
+```json
+{ "ok": true }
+```
+
+`400` if `tipo` is empty, longer than 1024 bytes or contains `:`; `422` if the
+body has no `tipo` string.
+
 ---
 
 ## 5. Connecting from a Node.js backend
