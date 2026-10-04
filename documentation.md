@@ -380,11 +380,18 @@ has at least 3 characters: `nomi` finds "Nómina", `NÓMI` too. A final `z` is
 kept rather than turned into `c` (as `luz` → `luc` would be), because a
 partial word goes on with the `z`: `plaz` finds "Plaza" but not "Placa", and
 `actualiz` finds "Actualización"; the whole word `luz` still finds "luces"
-through `q` itself. The expansion is
-capped at 200 index terms per field and segment. Each field that matches by
-prefix adds 1.0 to the score and a whole word also scores as usual, so exact
-matches rank first. The prefix is an alternative to `q`, so an exclusion such
-as `-x` in `q` does not apply to it; `acl` and `tipo` always do.
+through `q` itself. Each field that matches by prefix adds 1.0 to the score
+and a whole word also scores as usual, so exact matches rank first. The
+prefix is an alternative to `q`, so an exclusion such as `-x` in `q` does not
+apply to it; `acl` and `tipo` always do.
+
+The expansion is capped at 200 index terms per field and per segment, taken
+in lexicographic order from the prefix on, across *all* the documents in the
+segment: every `tipo` and every `acl`, not only those the caller can see (and
+deleted ones until segments merge). A short prefix (3–4 letters) can
+therefore run out of budget before it reaches the word the caller meant, and
+since the budget is per segment, results can shift after a merge. Typing more
+letters resolves it.
 
 **Response** — `200 OK`
 
@@ -732,4 +739,11 @@ The PostgreSQL schema expected by `reindex`:
   (`admin_id` may be `NULL`).
 
 `extracted_text` is indexed as `contenido`. Any column except `id` may be
-`NULL`.
+`NULL`, with two exceptions in the chat tables:
+
+- `user_threads.user_id` must not be `NULL` (the column is `NOT NULL` today):
+  a `NULL` aborts the whole `reindex` with "error leyendo chat", leaving the
+  previous index as it was.
+- `chat.threadid` must not be empty: a message whose `threadid` is `''` is
+  indexed without `thread`, so `/index/delete/thread` cannot delete it (only
+  `/index/delete` by `id` or `/index/delete/tipo` can).
