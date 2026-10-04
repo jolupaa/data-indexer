@@ -479,19 +479,26 @@ async fn query_syntax_cannot_widen_access() {
     upsert(&app, noticia("1", "turnos")).await;
     upsert(&app, chat("7101", "t-ana", "turnos", &["u:usr-ana"])).await;
 
+    // Cada `q` llega a 7101: su dueña lo encuentra. Así, si nadie más lo ve es
+    // por el filtro de `acl`, y no porque la consulta no case con él.
     for q in [
         "*",
         "turnos",
-        "acl:u%3Ausr-ana",
+        // Comillas sin cerrar: se busca como texto plano.
+        "%22turnos",
+        "*%20-x",
         "acl:%22u%3Ausr-ana%22",
-        "acl:public",
+        "acl:public%20OR%20turnos",
         "tipo:chat_msg",
         "thread:t-ana",
-        "-x",
+        "id:7101",
         "turnos%20OR%20acl:%22u%3Ausr-ana%22",
         "*%20OR%20tipo:chat_msg",
         "%2Bturnos%20-acl:public",
     ] {
+        let owner = format!("q={q}&acl=u:usr-ana");
+        let found = ids(&search(&app, &owner).await);
+        assert!(found.contains(&"7101".to_string()), "{owner}: {found:?}");
         for extra in ["", "&acl=public", "&acl=u:usr-bob", "&tipo=chat_msg"] {
             let uri = format!("q={q}{extra}");
             let found = ids(&search(&app, &uri).await);
