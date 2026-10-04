@@ -33,6 +33,19 @@ struct InfoDoc {
     created_at: String,
 }
 
+/// Un mensaje de chat con los participantes de su conversación.
+#[derive(sqlx::FromRow)]
+struct ChatMessage {
+    id: String,
+    thread: String,
+    contenido: String,
+    fecha: String,
+    /// `user_threads.user_id`: el empleado dueño de la conversación.
+    user_id: String,
+    /// `user_threads.admin_id`: el admin asignado; NULL si se borró su cuenta.
+    admin_id: Option<String>,
+}
+
 /// Reconstruye el índice completo desde PostgreSQL.
 ///
 /// Se reconstruye dentro del propio índice: se marcan todos los documentos como
@@ -56,11 +69,12 @@ pub async fn reindex() -> Result<()> {
 
     let noticias = index_noticias(&pool, &index_writer, fields).await?;
     let info_docs = index_infodocs(&pool, &index_writer, fields).await?;
+    let mensajes = index_chat_messages(&pool, &index_writer, fields).await?;
 
     finish_rebuild(&dir, index_writer)?;
     pool.close().await;
 
-    println!("Indexados {noticias} noticias y {info_docs} info_docs.");
+    println!("Indexados {noticias} noticias, {info_docs} info_docs y {mensajes} mensajes.");
     Ok(())
 }
 
@@ -331,6 +345,51 @@ pub async fn index_infodocs(
     Ok(count)
 }
 
+/// El documento de un mensaje de chat: el mismo que envía el backend. Lo ven
+/// el empleado de la conversación (`u:`) y su admin (`a:`), si tiene.
+fn chat_message_request(message: ChatMessage) -> IndexDocumentRequest {
+    let mut acl = vec![format!("u:{}", message.user_id)];
+    if let Some(admin_id) = message.admin_id {
+        acl.push(format!("a:{admin_id}"));
+    }
+    IndexDocumentRequest {
+        id: message.id,
+        tipo: "chat_msg".to_string(),
+        contenido: message.contenido,
+        fecha: message.fecha,
+        acl,
+        thread: message.thread,
+        ..Default::default()
+    }
+}
+
+pub async fn index_chat_messages(
+    pool: &PgPool,
+    index_writer: &IndexWriter,
+    fields: SearchFields,
+) -> Result<usize> {
+    // La SQL de la spec (§6.3). Los mensajes de una conversación sin fila en
+    // `user_threads` no los puede ver nadie: el JOIN los deja fuera.
+    let mut rows = sqlx::query_as::<_, ChatMessage>(
+        r#"
+        SELECT c.id::text AS id, c.threadid AS thread, COALESCE(c.content,'') AS contenido,
+               COALESCE(to_char(c.created_at, 'YYYY-MM-DD"T"HH24:MI:SS'),'') AS fecha,
+               ut.user_id, ut.admin_id
+        FROM chat c JOIN user_threads ut ON ut.thread_id = c.threadid
+        "#,
+    )
+    .fetch(pool);
+
+    let mut count = 0;
+    while let Some(message) = rows.try_next().await.context("error leyendo chat")? {
+        if index_row(index_writer, fields, chat_message_request(message))? {
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +638,68 @@ mod tests {
         assert!(index_row(&writer, fields, row("2", &["u:usr-emp-001"])).unwrap());
         finish_rebuild(tmp.path(), writer).unwrap();
         assert_eq!(num_docs(tmp.path()), 1);
+    }
+
+    fn message(admin_id: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            id: "7101".to_string(),
+            thread: "dev-thread-maria".to_string(),
+            contenido: "Te paso el calendario de turnos".to_string(),
+            fecha: "2026-10-03T08:42:00".to_string(),
+            user_id: "usr-emp-001".to_string(),
+            admin_id: admin_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_chat_message_is_visible_to_its_employee_and_admin() {
+        let request = chat_message_request(message(Some("usr-admin-001")));
+        assert_eq!(request.id, "7101");
+        assert_eq!(request.tipo, "chat_msg");
+        assert_eq!(request.thread, "dev-thread-maria");
+        assert_eq!(request.contenido, "Te paso el calendario de turnos");
+        assert_eq!(request.fecha, "2026-10-03T08:42:00");
+        assert_eq!(request.acl, ["u:usr-emp-001", "a:usr-admin-001"]);
+        assert_eq!(request.titulo, "");
+        assert_eq!(request.subtitulo, "");
+        assert_eq!(request.info_title, "");
+    }
+
+    #[test]
+    fn a_chat_message_without_admin_is_visible_only_to_its_employee() {
+        let request = chat_message_request(message(None));
+        assert_eq!(request.acl, ["u:usr-emp-001"]);
+    }
+
+    #[test]
+    fn reindexed_chat_messages_carry_their_acl_and_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (writer, fields) = open_for_rebuild(tmp.path()).unwrap();
+        assert!(
+            index_row(
+                &writer,
+                fields,
+                chat_message_request(message(Some("usr-admin-001")))
+            )
+            .unwrap()
+        );
+        finish_rebuild(tmp.path(), writer).unwrap();
+
+        let (index, fields) = open_index(tmp.path()).unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let count = |field, value: &str| {
+            let query = tantivy::query::TermQuery::new(
+                Term::from_field_text(field, value),
+                tantivy::schema::IndexRecordOption::Basic,
+            );
+            searcher.search(&query, &Count).unwrap()
+        };
+        assert_eq!(count(fields.acl, "u:usr-emp-001"), 1);
+        assert_eq!(count(fields.acl, "a:usr-admin-001"), 1);
+        assert_eq!(count(fields.acl, "public"), 0);
+        assert_eq!(count(fields.thread, "dev-thread-maria"), 1);
+        assert_eq!(count(fields.tipo, "chat_msg"), 1);
+        assert_eq!(count(fields.uid, "chat_msg:7101"), 1);
     }
 
     #[test]

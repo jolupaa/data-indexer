@@ -55,7 +55,7 @@ cargo run --release -- serve
 
 | Command   | Description                                                                 |
 | --------- | --------------------------------------------------------------------------- |
-| `reindex` | Rebuilds the index from PostgreSQL. Needs `DB_URL`. Stop `serve` first.     |
+| `reindex` | Rebuilds the index from PostgreSQL (news, info pages and chat messages). Needs `DB_URL`. Stop `serve` first. |
 | `serve`   | Serves the existing index over HTTP on `127.0.0.1:5000` (default command).  |
 
 | Variable    | Default           | Description                          |

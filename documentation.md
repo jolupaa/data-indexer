@@ -27,8 +27,9 @@ This document explains how to run the service and how to talk to it from a
 └────────────────┘                           └─────────────────────┘
 ```
 
-- **PostgreSQL** holds the source-of-truth data (`noticias` and `infoTabs`
-  tables). It is read only during a full `reindex`.
+- **PostgreSQL** holds the source-of-truth data (`noticias`, `infoTabs`, and
+  the chat messages in `chat` with their conversations in `user_threads`). It
+  is read only during a full `reindex`.
 - **`./search_index`** is the on-disk Tantivy index directory (configurable
   with `INDEX_DIR`). It is created by `reindex` and served by `serve`.
 - **Your Node.js backend** is the only thing that should call the HTTP API. The
@@ -96,6 +97,15 @@ cargo run --release -- serve
   committed. If the load fails, `serve` refuses to start with an empty or
   half-built index and asks you to run `reindex` again.
 - `NULL` columns are indexed as empty strings.
+- It loads `noticias` (`tipo` `noticia`), `infoTabs` (`info_doc`) and the chat
+  messages (`chat_msg`), and ends with
+  `Indexados N noticias, M info_docs y K mensajes.`
+- A chat message gets `thread` = its conversation and
+  `acl` = `["u:<user_id>", "a:<admin_id>"]` from `user_threads` (only `u:`
+  when the conversation has no admin); its `fecha` is `YYYY-MM-DDTHH:MM:SS`.
+  Messages whose conversation has no `user_threads` row are skipped, and so is
+  any row the API would reject (e.g. a principal with whitespace), with a
+  warning.
 
 #### Upgrading
 
@@ -110,7 +120,8 @@ an earlier version:
 
 1. Build the new binary (`cargo build --release`).
 2. Stop `serve`.
-3. Run the new binary's `reindex` (`DB_URL=… data-indexer reindex`).
+3. Run the new binary's `reindex` (`DB_URL=… data-indexer reindex`), which
+   also loads the chat messages.
 4. Start the new `serve`.
 
 While `serve` is down, searches and writes against it fail: your backend
@@ -698,6 +709,9 @@ The PostgreSQL schema expected by `reindex`:
   `fecha`.
 - Table `infoTabs` (unquoted, so PostgreSQL resolves it as `infotabs`) with
   columns `id`, `infotitle`, `title`, `extracted_text`, `subtitle`, `created_at`.
+- Table `chat` with columns `id`, `threadid`, `content`, `created_at`, and
+  table `user_threads` with columns `thread_id`, `user_id`, `admin_id`
+  (`admin_id` may be `NULL`).
 
 `extracted_text` is indexed as `contenido`. Any column except `id` may be
 `NULL`.
