@@ -749,6 +749,33 @@ async fn prefix_ignores_case_accents_and_a_trailing_space() {
 }
 
 #[tokio::test]
+async fn prefix_continues_a_partial_word_ending_in_z() {
+    let app = test_app();
+    upsert(&app, noticia("1", "Actualización de nóminas")).await;
+    upsert(&app, noticia("2", "Organización del evento")).await;
+    upsert(&app, noticia("3", "Autorizaciones pendientes")).await;
+    upsert(&app, noticia("4", "Plaza mayor")).await;
+    upsert(&app, noticia("5", "Placa base")).await;
+    upsert(&app, noticia("6", "Luces de Navidad")).await;
+
+    for (q, expected) in [
+        ("actualiz", "1"),
+        ("ACTUALIZ", "1"),
+        ("actualiza", "1"),
+        ("organiz", "2"),
+        ("autoriz", "3"),
+        ("autori", "3"),
+        // "plaz" sigue por "plaza", no por "placa".
+        ("plaz", "4"),
+        // Una palabra entera acabada en `z` sigue casando con su plural.
+        ("luz", "6"),
+    ] {
+        let uri = format!("q={q}&prefix=true");
+        assert_eq!(ids(&search(&app, &uri).await), [expected], "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn prefix_with_nothing_to_expand_returns_nothing() {
     let app = test_app();
     upsert(&app, noticia("1", "turnos")).await;

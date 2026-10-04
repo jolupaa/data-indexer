@@ -5,7 +5,10 @@ use tantivy::{
     Index, TantivyError,
     directory::error::LockError,
     schema::{Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions},
-    tokenizer::{AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer},
+    tokenizer::{
+        AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer,
+        TextAnalyzerBuilder, Tokenizer,
+    },
 };
 
 use crate::nfc::NfcTokenizer;
@@ -93,12 +96,23 @@ pub fn register_tokenizers(index: &Index) {
 /// El analizador de `ES_TOKENIZER`. Si cambia lo que produce, hay que subir la
 /// versión de `ES_TOKENIZER`.
 pub fn es_analyzer() -> TextAnalyzer {
+    folding_builder().filter(SpanishPluralFilter).build()
+}
+
+/// `es_analyzer` sin el filtro de plurales: cada palabra en minúsculas y sin
+/// tildes, pero tal y como se escribió. Lo usa `prefix=true`, que necesita la
+/// palabra a medias y no su singular.
+pub fn folding_analyzer() -> TextAnalyzer {
+    folding_builder().build()
+}
+
+/// Los pasos comunes a `es_analyzer` y `folding_analyzer`, para que no puedan
+/// separarse.
+fn folding_builder() -> TextAnalyzerBuilder<impl Tokenizer> {
     TextAnalyzer::builder(NfcTokenizer::new(SimpleTokenizer::default()))
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
         .filter(AsciiFoldingFilter)
-        .filter(SpanishPluralFilter)
-        .build()
 }
 
 /// Crea un índice vacío con el esquema actual y el analizador registrado.

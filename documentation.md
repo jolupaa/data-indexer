@@ -362,7 +362,11 @@ instead of failing.
 **Prefix matching.** With `prefix=true`, the last word of `q` — after the same
 analysis as the index: lowercase, no accents, singular — also matches as a
 prefix in `titulo`, `subtitulo`, `info_title` and `contenido`, as long as it
-has at least 3 characters: `nomi` finds "Nómina", `NÓMI` too. The expansion is
+has at least 3 characters: `nomi` finds "Nómina", `NÓMI` too. A final `z` is
+kept rather than turned into `c` (as `luz` → `luc` would be), because a
+partial word goes on with the `z`: `plaz` finds "Plaza" but not "Placa", and
+`actualiz` finds "Actualización"; the whole word `luz` still finds "luces"
+through `q` itself. The expansion is
 capped at 200 index terms per field and segment. Each field that matches by
 prefix adds 1.0 to the score and a whole word also scores as usual, so exact
 matches rank first. The prefix is an alternative to `q`, so an exclusion such

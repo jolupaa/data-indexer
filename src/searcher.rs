@@ -11,13 +11,13 @@ use tantivy::{
         QueryParser, TermQuery, TermSetQuery,
     },
     schema::{IndexRecordOption, NamedFieldDocument},
-    tokenizer::TokenStream,
+    tokenizer::{TextAnalyzer, TokenStream},
 };
 use unicode_normalization::UnicodeNormalization;
 
 use crate::acl::search_principals;
 use crate::error::ApiError;
-use crate::init::{SearchFields, es_analyzer};
+use crate::init::{SearchFields, es_analyzer, folding_analyzer};
 use crate::state::AppState;
 
 pub const DEFAULT_LIMIT: usize = 10;
@@ -186,20 +186,38 @@ fn with_prefix(
     Box::new(BooleanQuery::new(clauses))
 }
 
-/// La última palabra de `q` tal y como queda tras el analizador del índice
-/// (minúsculas, sin tildes, en singular), si tiene al menos
-/// `MIN_PREFIX_CHARS` caracteres. Se toma de `plain_text(q)`, así que la
-/// sintaxis de consulta (`"`, `-`, `campo:`) no cuenta como palabra.
+/// La última palabra de `q` como prefijo de los términos del índice, si tiene
+/// al menos `MIN_PREFIX_CHARS` caracteres. Se toma de `plain_text(q)`, así que
+/// la sintaxis de consulta (`"`, `-`, `campo:`) no cuenta como palabra.
+///
+/// Pasa por el analizador del índice (minúsculas, sin tildes, en singular).
+/// Su filtro de plurales sólo recorta ("nominas" → "nomina"), y lo recortado
+/// sigue siendo un prefijo de lo tecleado, salvo por la `z` final, que pasa a
+/// `c` ("luz" → "luc"). Eso vale para una palabra entera, pero una palabra a
+/// medias como "plaz" sigue por la `z` ("plaza"), no por la `c` ("placa"); en
+/// ese caso el prefijo es la palabra sin pasar a singular. La palabra entera
+/// ("luz" y su plural "luces") ya la encuentra el texto de `q`.
 fn last_prefix_term(q: &str) -> Option<String> {
     let plain = plain_text(q);
     let last_word = plain.split_whitespace().last()?;
-    let mut analyzer = es_analyzer();
-    let mut stream = analyzer.token_stream(last_word);
-    let mut term = None;
+    let folded = last_token(&mut folding_analyzer(), last_word)?;
+    let stemmed = last_token(&mut es_analyzer(), last_word)?;
+    let term = if folded.starts_with(&stemmed) {
+        stemmed
+    } else {
+        folded
+    };
+    Some(term).filter(|term| term.chars().count() >= MIN_PREFIX_CHARS)
+}
+
+/// El último término que produce `analyzer` para `text`.
+fn last_token(analyzer: &mut TextAnalyzer, text: &str) -> Option<String> {
+    let mut stream = analyzer.token_stream(text);
+    let mut token = None;
     while stream.advance() {
-        term = Some(stream.token().text.clone());
+        token = Some(stream.token().text.clone());
     }
-    term.filter(|term| term.chars().count() >= MIN_PREFIX_CHARS)
+    token
 }
 
 /// Deja en `query` sólo los documentos que comparten algún principal con
@@ -285,6 +303,23 @@ mod tests {
         assert_eq!(last_prefix_term("nomi   ").as_deref(), Some("nomi"));
         assert_eq!(last_prefix_term("\"turnos de oct").as_deref(), Some("oct"));
         assert_eq!(last_prefix_term("tipo:chat_msg").as_deref(), Some("msg"));
+    }
+
+    #[test]
+    fn a_partial_word_ending_in_z_keeps_its_z() {
+        // En una palabra entera la `z` final pasa a `c` ("luz" → "luc"), pero
+        // a medias la palabra sigue por la `z` ("plaz" → "plaza").
+        assert_eq!(last_prefix_term("actualiz").as_deref(), Some("actualiz"));
+        assert_eq!(last_prefix_term("organiz").as_deref(), Some("organiz"));
+        assert_eq!(last_prefix_term("AUTORIZ").as_deref(), Some("autoriz"));
+        assert_eq!(last_prefix_term("plaz").as_deref(), Some("plaz"));
+        // Lo que el filtro de plurales sólo recorta sigue recortado.
+        assert_eq!(last_prefix_term("nominas").as_deref(), Some("nomina"));
+        assert_eq!(last_prefix_term("plazas").as_deref(), Some("plaza"));
+        assert_eq!(
+            last_prefix_term("actualizaciones").as_deref(),
+            Some("actualizacion")
+        );
     }
 
     #[test]
