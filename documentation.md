@@ -396,11 +396,21 @@ paths or internal messages never reach your users.
 
 ### 4.5 `GET /health`
 
-Returns `200 OK` with the number of documents currently searchable:
+Returns `200 OK` with the number of documents currently searchable, the schema
+version and the features this version supports:
 
 ```json
-{ "ok": true, "docs": 1234 }
+{
+  "ok": true,
+  "docs": 1234,
+  "schema": 3,
+  "features": ["acl", "thread", "stats", "prefix", "delete_thread", "delete_tipo"]
+}
 ```
+
+Check `features` before relying on one of them. In particular, a version
+without `acl` ignores the `acl` key of an upsert and stores the document as
+public, so never send private documents to it.
 
 ### 4.6 `DELETE /index/delete/thread`
 
@@ -442,6 +452,19 @@ chat message). `tipo` is trimmed, as on upsert.
 
 `400` if `tipo` is empty, longer than 1024 bytes or contains `:`; `422` if the
 body has no `tipo` string.
+
+### 4.8 `GET /stats`
+
+Counts the live documents — deleted or replaced ones are not counted, even
+before their segments are merged — in total and per `tipo`:
+
+```json
+{ "total": 1300, "by_tipo": { "chat_msg": 1150, "info_doc": 30, "noticia": 120 } }
+```
+
+`noticia`, `info_doc` and `chat_msg` are always present, with `0` when there
+are none; any other `tipo` appears only while it has documents. Every document
+has a `tipo`, so `total` is the sum of `by_tipo`.
 
 ---
 

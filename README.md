@@ -20,6 +20,8 @@ and search documents — designed to sit behind a Node.js (or any) backend.
   principals may see.
 - Search-as-you-type: with `prefix=true` the last word also matches as a
   prefix (`nomi` finds `Nómina`).
+- `/stats` with per-`tipo` counts for reconciliation, and bulk deletes of a
+  whole conversation (`thread`) or corpus (`tipo`).
 - Idempotent upsert keyed by a composite `uid` (`tipo:id`), single or batched.
 - Safe bulk `reindex` straight from PostgreSQL: the rebuild is applied in a
   single commit, so a failure half-way leaves the previous index intact.
@@ -72,7 +74,8 @@ cargo run --release -- serve
 | `DELETE` | `/index/delete/thread` | Delete every document of a conversation.       |
 | `DELETE` | `/index/delete/tipo`  | Delete every document of a `tipo`.              |
 | `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=&acl=&prefix=`). |
-| `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.    |
+| `GET`    | `/stats`              | Document counts, in total and per `tipo`.       |
+| `GET`    | `/health`             | Liveness, document count, schema version and supported features. |
 
 ### Example
 

@@ -159,6 +159,10 @@ const KNOWN_FIELD_SETS: [&[&str]; 3] = [
     ],
 ];
 
+/// Versión del esquema que anuncia `/health` (la v3 añadió `acl` y `thread`).
+/// Súbela si cambian los campos de `build_schema` o `ES_TOKENIZER`.
+pub const SCHEMA_VERSION: u32 = 3;
+
 /// Examina el índice de `dir`. Los `Field` se reconstruyen con `build_schema`,
 /// así que un índice con otro esquema haría que cada valor acabase en el campo
 /// equivocado: por eso se distingue como `Outdated`.

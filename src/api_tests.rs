@@ -309,12 +309,15 @@ async fn only_upserts_accept_large_bodies() {
 }
 
 #[tokio::test]
-async fn health_reports_document_count() {
+async fn health_reports_documents_schema_and_features() {
     let app = test_app();
     upsert(&app, noticia("1", "uno")).await;
     let (status, body) = send(&app, Method::GET, "/health", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, r#"{"ok":true,"docs":1}"#);
+    assert_eq!(
+        body,
+        r#"{"ok":true,"docs":1,"schema":3,"features":["acl","thread","stats","prefix","delete_thread","delete_tipo"]}"#
+    );
 }
 
 #[tokio::test]
@@ -861,4 +864,96 @@ async fn deletes_by_thread_and_tipo_validate_their_input() {
     )
     .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+async fn stats(app: &Router) -> Value {
+    let (status, body) = send(app, Method::GET, "/stats", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test]
+async fn stats_on_an_empty_index_reports_every_known_corpus() {
+    let app = test_app();
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 0, "by_tipo": {"noticia": 0, "info_doc": 0, "chat_msg": 0}})
+    );
+}
+
+#[tokio::test]
+async fn stats_counts_live_documents_per_tipo() {
+    let app = test_app();
+    upsert(&app, noticia("1", "uno")).await;
+    upsert(&app, noticia("2", "dos")).await;
+    upsert(&app, noticia("1", "uno, otra vez")).await; // sustituye al 1
+    upsert(
+        &app,
+        json!({"id": "1", "tipo": "info_doc", "titulo": "info"}),
+    )
+    .await;
+    upsert(&app, chat("7101", "t1", "hola", &["u:usr-ana"])).await;
+    upsert(&app, chat("7102", "t1", "hola", &["u:usr-ana"])).await;
+    upsert(&app, chat("7201", "t2", "hola", &["u:usr-bob"])).await;
+    upsert(&app, json!({"id": "x", "tipo": "otro"})).await;
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete",
+        Some(json!({"id": "2", "tipo": "noticia"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete/thread",
+        Some(json!({"thread": "t2"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 5, "by_tipo": {"noticia": 1, "info_doc": 1, "chat_msg": 2, "otro": 1}})
+    );
+
+    // Un tipo vaciado desaparece; los conocidos se quedan, con 0.
+    for tipo in ["otro", "chat_msg"] {
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            "/index/delete/tipo",
+            Some(json!({ "tipo": tipo })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 2, "by_tipo": {"noticia": 1, "info_doc": 1, "chat_msg": 0}})
+    );
+}
+
+#[tokio::test]
+async fn resending_a_message_counts_and_shows_it_once() {
+    let app = test_app();
+    let message = chat("7101", "t1", "turnos", &["u:usr-ana", "a:usr-laura"]);
+    // Reintentos del outbox: el mismo mensaje, suelto y dos veces en un lote.
+    upsert(&app, message.clone()).await;
+    upsert(&app, message.clone()).await;
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/index/upsert/batch",
+        Some(json!([message.clone(), message.clone()])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 1, "by_tipo": {"noticia": 0, "info_doc": 0, "chat_msg": 1}})
+    );
+    assert_eq!(search(&app, "q=turnos&acl=u:usr-ana").await.len(), 1);
 }
