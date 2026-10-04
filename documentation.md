@@ -99,15 +99,29 @@ cargo run --release -- serve
 
 #### Upgrading
 
-The index stores the name of the text analyzer it was built with. When the
-analyzer changes between versions (as it did when accent handling and Spanish
-plurals were fixed), `serve` refuses to open an index built by the old version
-and asks you to run `reindex`. Run it once after upgrading. In that case
-`reindex` discards the old index before loading from PostgreSQL (the old one
-is unusable by the new version anyway).
+The index stores its schema: the fields and the name of the text analyzer it
+was built with. When either changes between versions, `serve` refuses to open
+an index built by the old version and asks you to run `reindex`, which
+discards the old index before loading from PostgreSQL (the old one is
+unusable by the new version anyway).
 
-The reverse also holds: older versions can't use an index built by this one,
-so if you ever roll back, run the older version's `reindex` too.
+Schema 3 (this version) added the `acl` and `thread` fields. To upgrade from
+an earlier version:
+
+1. Build the new binary (`cargo build --release`).
+2. Stop `serve`.
+3. Run the new binary's `reindex` (`DB_URL=… data-indexer reindex`).
+4. Start the new `serve`.
+
+While `serve` is down, searches and writes against it fail: your backend
+should fall back to its own search, and anything it writes between the start
+of `reindex` and the restart is missing from the index until it re-sends it.
+
+**Rolling back.** An older binary refuses an index built by a newer one: both
+its `serve` and its `reindex` stop with "…no es de data-indexer (o es de una
+versión más nueva); no se usará" and leave the directory untouched. To roll
+back, stop `serve`, empty `INDEX_DIR` (or point it at a new, empty
+directory), run the older binary's `reindex` and start its `serve`.
 
 #### Shutdown
 

@@ -500,6 +500,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recreates_a_v2_index_as_v3() {
+        let tmp = tempfile::tempdir().unwrap();
+        Index::create_in_dir(tmp.path(), crate::init::tests::v2_schema()).unwrap();
+
+        let (writer, _) = open_for_rebuild(tmp.path()).unwrap();
+        finish_rebuild(tmp.path(), writer).unwrap();
+
+        let (index, fields) = open_index(tmp.path()).unwrap();
+        assert_eq!(index.schema().get_field_name(fields.thread), "thread");
+    }
+
     #[cfg(unix)]
     #[test]
     fn recreates_an_old_index_whose_meta_json_is_a_symlink() {

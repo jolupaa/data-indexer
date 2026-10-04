@@ -37,9 +37,12 @@ DB_URL="postgres://user:password@localhost:5432/mydb" cargo run --release -- rei
 cargo run --release -- serve
 ```
 
-> **Upgrading from an earlier version?** The text analyzer changed, so run
-> `reindex` once (with `serve` stopped). `serve` refuses to open an index built
-> by an older version and tells you so.
+> **Upgrading from an earlier version?** Schema 3 added the `acl` and `thread`
+> fields: stop `serve`, run the new `reindex` once and start `serve` again.
+> `serve` refuses to open an index built by an older version and tells you so,
+> and an older binary refuses a schema-3 index too, so rolling back means
+> emptying `INDEX_DIR` and running the older `reindex`. See
+> [documentation.md](./documentation.md#upgrading).
 
 ## Commands
 

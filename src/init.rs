@@ -35,6 +35,12 @@ pub struct SearchFields {
     pub subtitulo: Field,
     pub contenido: Field,
     pub fecha: Field,
+    /// Principales que pueden ver el documento (`public`, `u:<id>`, `a:<id>`).
+    /// Indexado y no guardado: nunca sale en los resultados.
+    pub acl: Field,
+    /// Conversación a la que pertenece un `chat_msg`. Guardado, para que el
+    /// backend agrupe por conversación, e indexado, para borrarla entera.
+    pub thread: Field,
 }
 
 impl SearchFields {
@@ -69,6 +75,9 @@ pub fn build_schema() -> (Schema, SearchFields) {
         subtitulo: schema_builder.add_text_field("subtitulo", folded_text(true)),
         contenido: schema_builder.add_text_field("contenido", folded_text(false)),
         fecha: schema_builder.add_text_field("fecha", STRING | STORED),
+        // v3: siempre al final, para que los campos anteriores no cambien.
+        acl: schema_builder.add_text_field("acl", STRING),
+        thread: schema_builder.add_text_field("thread", STRING | STORED),
     };
 
     (schema_builder.build(), fields)
@@ -116,14 +125,15 @@ pub enum IndexStatus {
     Ready(Index, SearchFields),
 }
 
-/// Campos de los índices de cada versión de data-indexer: la primera y las que
-/// añadieron `uid`, `subtitulo` e `info_title` (la actual). Un índice con otros
-/// campos es de otra aplicación (o de una versión más nueva) y no se toca.
+/// Campos de los índices de cada versión de data-indexer: la primera, la que
+/// añadió `uid`, `subtitulo` e `info_title` (v2) y la que añadió `acl` y
+/// `thread` (v3, la actual). Un índice con otros campos es de otra aplicación
+/// (o de una versión más nueva) y no se toca.
 ///
 /// Si cambian los campos de `build_schema`, añade el conjunto nuevo al final;
 /// no edites los anteriores o dejarán de reconocerse (y de migrarse) los
 /// índices de esas versiones.
-const KNOWN_FIELD_SETS: [&[&str]; 2] = [
+const KNOWN_FIELD_SETS: [&[&str]; 3] = [
     &["id", "tipo", "titulo", "contenido", "autor", "fecha"],
     &[
         "id",
@@ -134,6 +144,18 @@ const KNOWN_FIELD_SETS: [&[&str]; 2] = [
         "subtitulo",
         "contenido",
         "fecha",
+    ],
+    &[
+        "id",
+        "uid",
+        "tipo",
+        "info_title",
+        "titulo",
+        "subtitulo",
+        "contenido",
+        "fecha",
+        "acl",
+        "thread",
     ],
 ];
 
@@ -321,6 +343,67 @@ pub(crate) mod tests {
             panic!("no debería abrir un índice con otro esquema");
         };
         assert!(err.to_string().contains("reindex"), "{err}");
+    }
+
+    /// El esquema v2: los 8 campos de antes de `acl` y `thread`, con el
+    /// analizador actual.
+    pub fn v2_schema() -> Schema {
+        let mut builder = Schema::builder();
+        builder.add_text_field("id", STRING | STORED);
+        builder.add_text_field("uid", STRING | STORED);
+        builder.add_text_field("tipo", STRING | STORED);
+        builder.add_text_field("info_title", folded_text(true));
+        builder.add_text_field("titulo", folded_text(true));
+        builder.add_text_field("subtitulo", folded_text(true));
+        builder.add_text_field("contenido", folded_text(false));
+        builder.add_text_field("fecha", STRING | STORED);
+        builder.build()
+    }
+
+    #[test]
+    fn a_v2_index_on_disk_is_outdated() {
+        let tmp = tempfile::tempdir().unwrap();
+        Index::create_in_dir(tmp.path(), v2_schema()).unwrap();
+
+        assert!(matches!(
+            inspect_index(tmp.path()).unwrap(),
+            IndexStatus::Outdated
+        ));
+        let Err(err) = open_index(tmp.path()) else {
+            panic!("`serve` no debería abrir un índice v2");
+        };
+        assert!(err.to_string().contains("ejecuta `reindex`"), "{err}");
+    }
+
+    #[test]
+    fn v3_appends_acl_and_thread_after_the_v2_fields() {
+        let (schema, fields) = build_schema();
+        let names: Vec<&str> = schema.fields().map(|(_, entry)| entry.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "id",
+                "uid",
+                "tipo",
+                "info_title",
+                "titulo",
+                "subtitulo",
+                "contenido",
+                "fecha",
+                "acl",
+                "thread"
+            ]
+        );
+        // Los campos de v2 no cambian ni de posición ni de opciones.
+        let v2 = v2_schema();
+        for (field, entry) in v2.fields() {
+            assert_eq!(schema.get_field_entry(field), entry);
+        }
+
+        let acl = schema.get_field_entry(fields.acl);
+        assert!(acl.is_indexed() && !acl.is_stored());
+        let thread = schema.get_field_entry(fields.thread);
+        assert!(thread.is_indexed() && thread.is_stored());
     }
 
     #[test]
