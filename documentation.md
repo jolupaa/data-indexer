@@ -124,6 +124,9 @@ an earlier version:
    also loads the chat messages.
 4. Start the new `serve`.
 
+Indexing the chat messages changes the ranking of public searches even though
+no public document changed; see *Scoring* in [`GET /search`](#44-get-search).
+
 While `serve` is down, searches and writes against it fail: your backend
 should fall back to its own search, and anything it writes between the start
 of `reindex` and the restart is missing from the index until it re-sends it.
@@ -358,6 +361,17 @@ singular/plural don't matter.
 If `q` is not valid syntax — e.g. `12:30`, a URL, or an unclosed quote — or
 nests parentheses more than 8 levels deep, it is searched as plain words
 instead of failing.
+
+**Scoring.** `score` is Tantivy's BM25, whose statistics (the number of
+documents, how many contain each term, the average length of each field) are
+computed over *every* document in the index, whatever its `tipo` or `acl`,
+including those the caller cannot see. The `acl` filter itself adds nothing:
+a document scores exactly what the same query gives it without the filter on
+the same index. Adding documents, private ones included, does change the
+scores of the rest. In particular, once chat messages are indexed, public
+search ranking (news ordered by relevance, universal search) changes, though
+no public document did: which documents match stays the same, their scores
+and order do not, so a page cut by `limit` can differ.
 
 **Prefix matching.** With `prefix=true`, the last word of `q` — after the same
 analysis as the index: lowercase, no accents, singular — also matches as a

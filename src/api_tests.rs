@@ -593,8 +593,12 @@ async fn without_acl_results_and_scores_are_those_of_v2() {
         json!({"id": "4", "tipo": "info_doc", "titulo": "Anual", "info_title": "Presupuestos"}),
     )
     .await;
-    // Documentos privados que también casan: cuentan en las estadísticas de
-    // BM25 igual que en v2, pero no salen.
+    // Documentos privados que también casan. No salen, pero están en el índice
+    // y cuentan en las estadísticas de BM25 (número de documentos, documentos
+    // con cada término, longitud media de cada campo): la consulta y las
+    // puntuaciones son las de v2 sobre este mismo índice, no las de un índice
+    // sin ellos. Añadir documentos privados cambia las puntuaciones de los
+    // públicos y puede cambiar su orden.
     upsert(&app, chat("c1", "t1", "presupuesto anual", &["u:usr-ana"])).await;
     upsert(&app, chat("c2", "t1", "presupuesto", &["u:usr-ana"])).await;
 

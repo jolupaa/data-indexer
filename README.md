@@ -50,6 +50,12 @@ cargo run --release -- serve
 > and an older binary refuses a schema-3 index too, so rolling back means
 > emptying `INDEX_DIR` and running the older `reindex`. See
 > [documentation.md](./documentation.md#upgrading).
+>
+> Once chat messages are indexed, public search ranking (news ordered by
+> relevance, universal search) changes: relevance statistics are computed
+> over every document in the index, private ones included. Which documents
+> match does not change; their scores and order do, so a page cut by `limit`
+> can differ.
 
 ## Commands
 
