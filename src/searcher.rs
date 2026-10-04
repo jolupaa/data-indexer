@@ -6,12 +6,17 @@ use serde::{Deserialize, Serialize};
 use tantivy::{
     Document, TantivyDocument, Term,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query as TantivyQuery, QueryParser, TermQuery},
+    query::{
+        BooleanQuery, ConstScoreQuery, Occur, Query as TantivyQuery, QueryParser, TermQuery,
+        TermSetQuery,
+    },
     schema::{IndexRecordOption, NamedFieldDocument},
 };
 use unicode_normalization::UnicodeNormalization;
 
+use crate::acl::search_principals;
 use crate::error::ApiError;
+use crate::init::SearchFields;
 use crate::state::AppState;
 
 pub const DEFAULT_LIMIT: usize = 10;
@@ -35,6 +40,8 @@ pub struct SearchParams {
     pub tipo: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Principales separados por comas (`u:1,a:1`). Sin él, `public`.
+    pub acl: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -59,13 +66,21 @@ pub async fn search_documents(
             "`q` no puede tener más de {MAX_QUERY_CHARS} caracteres"
         )));
     }
+    let principals = search_principals(params.acl.as_deref())?;
     if limit == 0 {
         return Ok(Json(Vec::new()));
     }
 
     // Buscar y leer los documentos es E/S bloqueante sobre el índice mmap.
     let results = tokio::task::spawn_blocking(move || {
-        run_search(&state, &params.q, params.tipo.as_deref(), limit, offset)
+        run_search(
+            &state,
+            &params.q,
+            params.tipo.as_deref(),
+            &principals,
+            limit,
+            offset,
+        )
     })
     .await
     .map_err(ApiError::internal)?
@@ -78,26 +93,11 @@ fn run_search(
     state: &AppState,
     q: &str,
     tipo: Option<&str>,
+    principals: &[String],
     limit: usize,
     offset: usize,
 ) -> tantivy::Result<Vec<SearchResult>> {
-    let text_query = parse_user_query(&state.query_parser, q);
-
-    let final_query: Box<dyn TantivyQuery> = match tipo.map(str::trim) {
-        Some(tipo_doc) if !tipo_doc.is_empty() => {
-            let tipo_term = Term::from_field_text(state.fields.tipo, tipo_doc);
-
-            let tipo_query: Box<dyn TantivyQuery> =
-                Box::new(TermQuery::new(tipo_term, IndexRecordOption::Basic));
-
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Must, text_query),
-                (Occur::Must, tipo_query),
-            ]))
-        }
-
-        _ => text_query,
-    };
+    let final_query = restrict_to(&state.fields, principals, base_query(state, q, tipo));
 
     let searcher = state.reader.searcher();
     let top_docs = searcher.search(
@@ -116,6 +116,46 @@ fn run_search(
             })
         })
         .collect()
+}
+
+/// La consulta de v2: el texto de `q` y, si se pide, el filtro por `tipo`.
+fn base_query(state: &AppState, q: &str, tipo: Option<&str>) -> Box<dyn TantivyQuery> {
+    let text_query = parse_user_query(&state.query_parser, q);
+
+    match tipo.map(str::trim) {
+        Some(tipo_doc) if !tipo_doc.is_empty() => {
+            let tipo_term = Term::from_field_text(state.fields.tipo, tipo_doc);
+
+            let tipo_query: Box<dyn TantivyQuery> =
+                Box::new(TermQuery::new(tipo_term, IndexRecordOption::Basic));
+
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, text_query),
+                (Occur::Must, tipo_query),
+            ]))
+        }
+
+        _ => text_query,
+    }
+}
+
+/// Deja en `query` sólo los documentos que comparten algún principal con
+/// `principals`. Es una cláusula `Must` aparte, así que nada de lo que lleve
+/// `q` (`*`, `acl:…`, `tipo:…`, `-x`) puede ampliar el resultado; y puntúa 0,
+/// así que las puntuaciones son exactamente las de `query`.
+fn restrict_to(
+    fields: &SearchFields,
+    principals: &[String],
+    query: Box<dyn TantivyQuery>,
+) -> Box<dyn TantivyQuery> {
+    let terms = principals
+        .iter()
+        .map(|principal| Term::from_field_text(fields.acl, principal));
+    let acl_filter = ConstScoreQuery::new(Box::new(TermSetQuery::new(terms)), 0.0);
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Must, query),
+        (Occur::Must, Box::new(acl_filter)),
+    ]))
 }
 
 /// Interpreta `q` con la sintaxis de consultas de tantivy (frases entre

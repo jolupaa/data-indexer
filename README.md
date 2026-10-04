@@ -15,6 +15,9 @@ and search documents — designed to sit behind a Node.js (or any) backend.
   insensitive to case and accents and to Spanish singular/plural
   (`clase` ≈ `clases`, `actualización` ≈ `actualizaciones`).
 - Optional filtering by document type (`tipo`), `limit` and `offset` pagination.
+- Per-document access control: each document lists who may see it in `acl`
+  (`public` when omitted) and `/search` only returns what its `acl`
+  principals may see.
 - Idempotent upsert keyed by a composite `uid` (`tipo:id`), single or batched.
 - Safe bulk `reindex` straight from PostgreSQL: the rebuild is applied in a
   single commit, so a failure half-way leaves the previous index intact.
@@ -64,7 +67,7 @@ cargo run --release -- serve
 | `POST`   | `/index/upsert`       | Insert or replace a document.                   |
 | `POST`   | `/index/upsert/batch` | Insert or replace many documents in one commit. |
 | `DELETE` | `/index/delete`       | Delete a document by `tipo` + `id`.             |
-| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=`).  |
+| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=&acl=`). |
 | `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.    |
 
 ### Example
@@ -77,6 +80,9 @@ curl -X POST http://127.0.0.1:5000/index/upsert \
 
 # Search
 curl "http://127.0.0.1:5000/search?q=hola&tipo=noticia&limit=5"
+
+# Search what employee usr-emp-001 may see
+curl "http://127.0.0.1:5000/search?q=turnos&tipo=chat_msg&acl=u:usr-emp-001"
 
 # Delete
 curl -X DELETE http://127.0.0.1:5000/index/delete \

@@ -193,6 +193,12 @@ A principal is 1–256 bytes without whitespace or commas, and is matched
 exactly: case-sensitive, never analysed, never a prefix of another one. `acl`
 is indexed but not stored, so it is never returned.
 
+`/search` only returns documents that share at least one principal with its
+`acl` parameter, or public ones when the parameter is missing. The filter is a
+separate required clause with a constant score of 0: nothing in `q` (`*`,
+`acl:…`, `tipo:…`, `-x`) can widen it, and scores are exactly those of the
+same query without it.
+
 ### Text analysis
 
 Searchable text goes through the same analyzer at index and at query time:
@@ -321,6 +327,7 @@ Runs a full-text query and returns the top matching documents, scored.
 | `tipo`   | no       | —       | If set (and non-empty), restricts results to that exact `tipo`.                      |
 | `limit`  | no       | `10`    | Maximum number of results to return. Values above `1000` are capped; `0` returns `[]`. |
 | `offset` | no       | `0`     | Number of top results to skip, for pagination (max `10000`).                          |
+| `acl`    | no       | `public` | Comma-separated principals (`u:usr-1,a:usr-1`, at most 64). Only documents that share at least one are returned; see [Access control](#access-control). |
 
 Example:
 
@@ -369,7 +376,7 @@ An array of results, ordered by descending relevance `score`:
 
 | Status | When                                                                       |
 | ------ | -------------------------------------------------------------------------- |
-| `400`  | Missing `q`, `q` longer than 1000 characters, or invalid `limit`/`offset`. |
+| `400`  | Missing `q`, `q` longer than 1000 characters, invalid `limit`/`offset`, an invalid `acl` (an empty value, whitespace, a value over 256 bytes or more than 64 values) or a repeated parameter. |
 | `500`  | Internal error (index read or search failure).                             |
 
 The body of an error is a plain-text message, not JSON. For `500` it is always
@@ -474,7 +481,7 @@ export async function deleteDocument(tipo, id) {
 /**
  * Search the index.
  * @param {string} q       query string
- * @param {{tipo?:string, limit?:number, offset?:number}} [opts]
+ * @param {{tipo?:string, limit?:number, offset?:number, acl?:string[]}} [opts]
  * @returns {Promise<Array<{score:number, doc:object}>>}
  */
 export async function search(q, opts = {}) {
@@ -482,6 +489,7 @@ export async function search(q, opts = {}) {
   if (opts.tipo) params.set("tipo", opts.tipo);
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.offset) params.set("offset", String(opts.offset));
+  if (opts.acl) params.set("acl", opts.acl.join(",")); // default: public
 
   const res = await fetch(`${BASE_URL}/search?${params.toString()}`);
 
@@ -583,6 +591,9 @@ app.listen(3000, () => console.log("Node backend on :3000"));
   reflected in the next `/search`.
 - **`contenido` is searchable but not returned.** Fetch the full body from your
   own database using the `id`/`tipo` from the search result.
+- **Documents without `acl` are public, and a search without `acl` only sees
+  public documents.** Send `acl` with every private document, and compute a
+  search's principals from the authenticated user, never from user input.
 - **Field values are arrays in results.** Use the `flattenDoc` helper above.
 - **No authentication.** The API is unauthenticated and binds to loopback. Do
   not expose it directly to the public internet — front it with your Node
