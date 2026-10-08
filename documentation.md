@@ -27,8 +27,9 @@ This document explains how to run the service and how to talk to it from a
 └────────────────┘                           └─────────────────────┘
 ```
 
-- **PostgreSQL** holds the source-of-truth data (`noticias` and `infoTabs`
-  tables). It is read only during a full `reindex`.
+- **PostgreSQL** holds the source-of-truth data (`noticias`, `infoTabs`, and
+  the chat messages in `chat` with their conversations in `user_threads`). It
+  is read only during a full `reindex`.
 - **`./search_index`** is the on-disk Tantivy index directory (configurable
   with `INDEX_DIR`). It is created by `reindex` and served by `serve`.
 - **Your Node.js backend** is the only thing that should call the HTTP API. The
@@ -96,18 +97,45 @@ cargo run --release -- serve
   committed. If the load fails, `serve` refuses to start with an empty or
   half-built index and asks you to run `reindex` again.
 - `NULL` columns are indexed as empty strings.
+- It loads `noticias` (`tipo` `noticia`), `infoTabs` (`info_doc`) and the chat
+  messages (`chat_msg`), and ends with
+  `Indexados N noticias, M info_docs y K mensajes.`
+- A chat message gets `thread` = its conversation and
+  `acl` = `["u:<user_id>", "a:<admin_id>"]` from `user_threads` (only `u:`
+  when the conversation has no admin); its `fecha` is `YYYY-MM-DDTHH:MM:SS`.
+  Messages whose conversation has no `user_threads` row are skipped, and so is
+  any row the API would reject (e.g. a principal with whitespace), with a
+  warning.
 
 #### Upgrading
 
-The index stores the name of the text analyzer it was built with. When the
-analyzer changes between versions (as it did when accent handling and Spanish
-plurals were fixed), `serve` refuses to open an index built by the old version
-and asks you to run `reindex`. Run it once after upgrading. In that case
-`reindex` discards the old index before loading from PostgreSQL (the old one
-is unusable by the new version anyway).
+The index stores its schema: the fields and the name of the text analyzer it
+was built with. When either changes between versions, `serve` refuses to open
+an index built by the old version and asks you to run `reindex`, which
+discards the old index before loading from PostgreSQL (the old one is
+unusable by the new version anyway).
 
-The reverse also holds: older versions can't use an index built by this one,
-so if you ever roll back, run the older version's `reindex` too.
+Schema 3 (this version) added the `acl` and `thread` fields. To upgrade from
+an earlier version:
+
+1. Build the new binary (`cargo build --release`).
+2. Stop `serve`.
+3. Run the new binary's `reindex` (`DB_URL=… data-indexer reindex`), which
+   also loads the chat messages.
+4. Start the new `serve`.
+
+Indexing the chat messages changes the ranking of public searches even though
+no public document changed; see *Scoring* in [`GET /search`](#44-get-search).
+
+While `serve` is down, searches and writes against it fail: your backend
+should fall back to its own search, and anything it writes between the start
+of `reindex` and the restart is missing from the index until it re-sends it.
+
+**Rolling back.** An older binary refuses an index built by a newer one: both
+its `serve` and its `reindex` stop with "…no es de data-indexer (o es de una
+versión más nueva); no se usará" and leave the directory untouched. To roll
+back, stop `serve`, empty `INDEX_DIR` (or point it at a new, empty
+directory), run the older binary's `reindex` and start its `serve`.
 
 #### Shutdown
 
@@ -156,11 +184,34 @@ are trimmed.
 | `contenido`  | text            | **no**  | yes                    | Searchable but **not returned** in results.      |
 | `fecha`      | string          | yes     | no (exact)             | Date as a string.                                |
 | `info_title` | text            | yes     | yes                    | Used by `info_doc`; omitted when empty.          |
+| `acl`        | string (list)   | **no**  | no (exact)             | Who may see it; `public` if not sent. Never returned. |
+| `thread`     | string          | yes     | no (exact)             | Conversation of a `chat_msg`; omitted when empty. |
 
 > **Important:** `contenido` is indexed for searching but is **not stored**, so it
 > will never appear in `/search` results. Only the stored fields are returned.
 
 Full-text search runs over `titulo`, `subtitulo`, `info_title`, and `contenido`.
+
+### Access control
+
+Every document carries one or more *principals* in `acl`. The indexer treats
+them as opaque strings; the GVinfo backend uses these:
+
+| Principal      | Meaning                                         |
+| -------------- | ----------------------------------------------- |
+| `public`       | Anyone. Implicit when a document has no `acl`.  |
+| `u:<users.id>` | The employee who owns a chat conversation.      |
+| `a:<users.id>` | The admin assigned to a chat conversation.      |
+
+A principal is 1–256 bytes without whitespace or commas, and is matched
+exactly: case-sensitive, never analysed, never a prefix of another one. `acl`
+is indexed but not stored, so it is never returned.
+
+`/search` only returns documents that share at least one principal with its
+`acl` parameter, or public ones when the parameter is missing. The filter is a
+separate required clause with a constant score of 0: nothing in `q` (`*`,
+`acl:…`, `tipo:…`, `-x`) can widen it, and scores are exactly those of the
+same query without it.
 
 ### Text analysis
 
@@ -201,11 +252,34 @@ repeatedly with the same `tipo`+`id` is safe (idempotent upsert).
 }
 ```
 
+A private chat message, visible to its employee and its admin:
+
+```json
+{
+  "id": "7101",
+  "tipo": "chat_msg",
+  "thread": "dev-thread-maria",
+  "contenido": "Te paso el calendario de turnos",
+  "fecha": "2026-10-03T08:42:00.000Z",
+  "acl": ["u:usr-emp-001", "a:usr-admin-001"]
+}
+```
+
 `id` and `tipo` are **required strings**. `titulo`, `subtitulo`, `contenido`,
-`fecha` and `info_title` are optional strings: missing or `null` means `""`.
-(If your source values are numbers or dates, convert them to strings before
-sending.) Upserting always replaces the whole document, so send every field you
-want to keep — including `info_title` for `info_doc` documents.
+`fecha`, `info_title` and `thread` are optional strings: missing or `null`
+means `""`. (If your source values are numbers or dates, convert them to
+strings before sending.) Upserting always replaces the whole document, so send
+every field you want to keep — including `info_title` for `info_doc` documents
+and `acl` for private ones (re-sending a document with another `acl` replaces
+its principals, e.g. when a conversation is reassigned).
+
+- `acl` (optional list of strings): who may see the document, see
+  [Access control](#access-control). Missing, `null` or `[]` means
+  `["public"]`. At most 32 values, each 1–256 bytes, without whitespace or
+  commas.
+- `thread` (optional string): the conversation a `chat_msg` belongs to.
+  Stored, returned in results and compared exactly (never trimmed); it may not
+  be blank or longer than 1024 bytes.
 
 The request body may be up to 64 MB (the other routes keep the default 2 MB).
 
@@ -215,8 +289,9 @@ The request body may be up to 64 MB (the other routes keep the default 2 MB).
 { "ok": true }
 ```
 
-`400` if `tipo`/`id` are empty or longer than 1024 bytes, or `tipo` contains
-`:`; `422` if the JSON does not have the expected shape.
+`400` if `tipo`/`id` are empty or longer than 1024 bytes, `tipo` contains
+`:`, or `acl`/`thread` break the rules above; `422` if the JSON does not have
+the expected shape (e.g. `acl` is a string instead of a list).
 
 ### 4.2 `POST /index/upsert/batch`
 
@@ -266,11 +341,14 @@ Runs a full-text query and returns the top matching documents, scored.
 | `tipo`   | no       | —       | If set (and non-empty), restricts results to that exact `tipo`.                      |
 | `limit`  | no       | `10`    | Maximum number of results to return. Values above `1000` are capped; `0` returns `[]`. |
 | `offset` | no       | `0`     | Number of top results to skip, for pagination (max `10000`).                          |
+| `acl`    | no       | `public` | Comma-separated principals (`u:usr-1,a:usr-1`, at most 64). Only documents that share at least one are returned; see [Access control](#access-control). |
+| `prefix` | no       | `false` | `true` also matches the last word of `q` as a prefix (see *Prefix matching* below).   |
 
 Example:
 
 ```
 GET /search?q=elecciones&tipo=noticia&limit=5&offset=10
+GET /search?q=turnos%20de%20oct&tipo=chat_msg&acl=u:usr-emp-001&prefix=true
 ```
 
 **Query syntax.** `q` accepts Tantivy's query syntax: several words match
@@ -283,6 +361,37 @@ singular/plural don't matter.
 If `q` is not valid syntax — e.g. `12:30`, a URL, or an unclosed quote — or
 nests parentheses more than 8 levels deep, it is searched as plain words
 instead of failing.
+
+**Scoring.** `score` is Tantivy's BM25, whose statistics (the number of
+documents, how many contain each term, the average length of each field) are
+computed over *every* document in the index, whatever its `tipo` or `acl`,
+including those the caller cannot see. The `acl` filter itself adds nothing:
+a document scores exactly what the same query gives it without the filter on
+the same index. Adding documents, private ones included, does change the
+scores of the rest. In particular, once chat messages are indexed, public
+search ranking (news ordered by relevance, universal search) changes, though
+no public document did: which documents match stays the same, their scores
+and order do not, so a page cut by `limit` can differ.
+
+**Prefix matching.** With `prefix=true`, the last word of `q` — after the same
+analysis as the index: lowercase, no accents, singular — also matches as a
+prefix in `titulo`, `subtitulo`, `info_title` and `contenido`, as long as it
+has at least 3 characters: `nomi` finds "Nómina", `NÓMI` too. A final `z` is
+kept rather than turned into `c` (as `luz` → `luc` would be), because a
+partial word goes on with the `z`: `plaz` finds "Plaza" but not "Placa", and
+`actualiz` finds "Actualización"; the whole word `luz` still finds "luces"
+through `q` itself. Each field that matches by prefix adds 1.0 to the score
+and a whole word also scores as usual, so exact matches rank first. The
+prefix is an alternative to `q`, so an exclusion such as `-x` in `q` does not
+apply to it; `acl` and `tipo` always do.
+
+The expansion is capped at 200 index terms per field and per segment, taken
+in lexicographic order from the prefix on, across *all* the documents in the
+segment: every `tipo` and every `acl`, not only those the caller can see (and
+deleted ones until segments merge). A short prefix (3–4 letters) can
+therefore run out of budget before it reaches the word the caller meant, and
+since the budget is per segment, results can shift after a merge. Typing more
+letters resolves it.
 
 **Response** — `200 OK`
 
@@ -306,14 +415,15 @@ An array of results, ordered by descending relevance `score`:
 
 > **Note on the `doc` shape:** Tantivy returns every stored field as an **array
 > of values** (even when there is only one value). So read `doc.titulo[0]`, not
-> `doc.titulo`. Also remember `contenido` is not stored and will be absent, and
-> `info_title` is only present on documents that have one.
+> `doc.titulo`. Also remember `contenido` is not stored and will be absent,
+> `info_title` and `thread` are only present on documents that have one, and
+> `acl` is never returned.
 
 **Error responses**
 
 | Status | When                                                                       |
 | ------ | -------------------------------------------------------------------------- |
-| `400`  | Missing `q`, `q` longer than 1000 characters, or invalid `limit`/`offset`. |
+| `400`  | Missing `q`, `q` longer than 1000 characters, invalid `limit`/`offset`, a `prefix` other than `true`/`false`, an invalid `acl` (an empty value, whitespace, a value over 256 bytes or more than 64 values) or a repeated parameter. |
 | `500`  | Internal error (index read or search failure).                             |
 
 The body of an error is a plain-text message, not JSON. For `500` it is always
@@ -322,11 +432,75 @@ paths or internal messages never reach your users.
 
 ### 4.5 `GET /health`
 
-Returns `200 OK` with the number of documents currently searchable:
+Returns `200 OK` with the number of documents currently searchable, the schema
+version and the features this version supports:
 
 ```json
-{ "ok": true, "docs": 1234 }
+{
+  "ok": true,
+  "docs": 1234,
+  "schema": 3,
+  "features": ["acl", "thread", "stats", "prefix", "delete_thread", "delete_tipo"]
+}
 ```
+
+Check `features` before relying on one of them. In particular, a version
+without `acl` ignores the `acl` key of an upsert and stores the document as
+public, so never send private documents to it.
+
+### 4.6 `DELETE /index/delete/thread`
+
+Removes every document of a conversation: all documents whose `thread` is
+exactly the given value.
+
+**Request body**
+
+```json
+{ "thread": "dev-thread-maria" }
+```
+
+**Response** — `200 OK`, also when no document matched:
+
+```json
+{ "ok": true }
+```
+
+`400` if `thread` is blank or longer than 1024 bytes; `422` if the body has no
+`thread` string.
+
+### 4.7 `DELETE /index/delete/tipo`
+
+Removes a whole corpus — every document of one `tipo` — so a client can load
+it again from scratch (e.g. `{"tipo": "chat_msg"}` before re-sending every
+chat message). `tipo` is trimmed, as on upsert.
+
+**Request body**
+
+```json
+{ "tipo": "chat_msg" }
+```
+
+**Response** — `200 OK`, also when no document matched:
+
+```json
+{ "ok": true }
+```
+
+`400` if `tipo` is empty, longer than 1024 bytes or contains `:`; `422` if the
+body has no `tipo` string.
+
+### 4.8 `GET /stats`
+
+Counts the live documents — deleted or replaced ones are not counted, even
+before their segments are merged — in total and per `tipo`:
+
+```json
+{ "total": 1300, "by_tipo": { "chat_msg": 1150, "info_doc": 30, "noticia": 120 } }
+```
+
+`noticia`, `info_doc` and `chat_msg` are always present, with `0` when there
+are none; any other `tipo` appears only while it has documents. Every document
+has a `tipo`, so `total` is the sum of `by_tipo`.
 
 ---
 
@@ -343,7 +517,7 @@ const BASE_URL = process.env.INDEXER_URL || "http://127.0.0.1:5000";
 
 /**
  * Insert or update a document in the search index.
- * @param {{id:string,tipo:string,titulo?:string,subtitulo?:string,contenido?:string,fecha?:string,info_title?:string}} doc
+ * @param {{id:string,tipo:string,titulo?:string,subtitulo?:string,contenido?:string,fecha?:string,info_title?:string,thread?:string,acl?:string[]}} doc
  */
 export async function upsertDocument(doc) {
   const res = await fetch(`${BASE_URL}/index/upsert`, {
@@ -357,6 +531,8 @@ export async function upsertDocument(doc) {
       contenido: String(doc.contenido ?? ""),
       fecha: String(doc.fecha ?? ""),
       info_title: String(doc.info_title ?? ""),
+      thread: String(doc.thread ?? ""),
+      acl: (doc.acl ?? []).map(String), // [] = public
     }),
   });
 
@@ -383,6 +559,8 @@ export async function upsertDocuments(docs) {
         contenido: String(doc.contenido ?? ""),
         fecha: String(doc.fecha ?? ""),
         info_title: String(doc.info_title ?? ""),
+        thread: String(doc.thread ?? ""),
+        acl: (doc.acl ?? []).map(String), // [] = public
       })),
     ),
   });
@@ -414,7 +592,7 @@ export async function deleteDocument(tipo, id) {
 /**
  * Search the index.
  * @param {string} q       query string
- * @param {{tipo?:string, limit?:number, offset?:number}} [opts]
+ * @param {{tipo?:string, limit?:number, offset?:number, acl?:string[], prefix?:boolean}} [opts]
  * @returns {Promise<Array<{score:number, doc:object}>>}
  */
 export async function search(q, opts = {}) {
@@ -422,6 +600,8 @@ export async function search(q, opts = {}) {
   if (opts.tipo) params.set("tipo", opts.tipo);
   if (opts.limit) params.set("limit", String(opts.limit));
   if (opts.offset) params.set("offset", String(opts.offset));
+  if (opts.acl) params.set("acl", opts.acl.join(",")); // default: public
+  if (opts.prefix) params.set("prefix", "true"); // search-as-you-type
 
   const res = await fetch(`${BASE_URL}/search?${params.toString()}`);
 
@@ -523,6 +703,9 @@ app.listen(3000, () => console.log("Node backend on :3000"));
   reflected in the next `/search`.
 - **`contenido` is searchable but not returned.** Fetch the full body from your
   own database using the `id`/`tipo` from the search result.
+- **Documents without `acl` are public, and a search without `acl` only sees
+  public documents.** Send `acl` with every private document, and compute a
+  search's principals from the authenticated user, never from user input.
 - **Field values are arrays in results.** Use the `flattenDoc` helper above.
 - **No authentication.** The API is unauthenticated and binds to loopback. Do
   not expose it directly to the public internet — front it with your Node
@@ -551,6 +734,16 @@ The PostgreSQL schema expected by `reindex`:
   `fecha`.
 - Table `infoTabs` (unquoted, so PostgreSQL resolves it as `infotabs`) with
   columns `id`, `infotitle`, `title`, `extracted_text`, `subtitle`, `created_at`.
+- Table `chat` with columns `id`, `threadid`, `content`, `created_at`, and
+  table `user_threads` with columns `thread_id`, `user_id`, `admin_id`
+  (`admin_id` may be `NULL`).
 
 `extracted_text` is indexed as `contenido`. Any column except `id` may be
-`NULL`.
+`NULL`, with two exceptions in the chat tables:
+
+- `user_threads.user_id` must not be `NULL` (the column is `NOT NULL` today):
+  a `NULL` aborts the whole `reindex` with "error leyendo chat", leaving the
+  previous index as it was.
+- `chat.threadid` must not be empty: a message whose `threadid` is `''` is
+  indexed without `thread`, so `/index/delete/thread` cannot delete it (only
+  `/index/delete` by `id` or `/index/delete/tipo` can).

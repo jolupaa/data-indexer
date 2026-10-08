@@ -15,6 +15,13 @@ and search documents — designed to sit behind a Node.js (or any) backend.
   insensitive to case and accents and to Spanish singular/plural
   (`clase` ≈ `clases`, `actualización` ≈ `actualizaciones`).
 - Optional filtering by document type (`tipo`), `limit` and `offset` pagination.
+- Per-document access control: each document lists who may see it in `acl`
+  (`public` when omitted) and `/search` only returns what its `acl`
+  principals may see.
+- Search-as-you-type: with `prefix=true` the last word also matches as a
+  prefix (`nomi` finds `Nómina`).
+- `/stats` with per-`tipo` counts for reconciliation, and bulk deletes of a
+  whole conversation (`thread`) or corpus (`tipo`).
 - Idempotent upsert keyed by a composite `uid` (`tipo:id`), single or batched.
 - Safe bulk `reindex` straight from PostgreSQL: the rebuild is applied in a
   single commit, so a failure half-way leaves the previous index intact.
@@ -37,15 +44,24 @@ DB_URL="postgres://user:password@localhost:5432/mydb" cargo run --release -- rei
 cargo run --release -- serve
 ```
 
-> **Upgrading from an earlier version?** The text analyzer changed, so run
-> `reindex` once (with `serve` stopped). `serve` refuses to open an index built
-> by an older version and tells you so.
+> **Upgrading from an earlier version?** Schema 3 added the `acl` and `thread`
+> fields: stop `serve`, run the new `reindex` once and start `serve` again.
+> `serve` refuses to open an index built by an older version and tells you so,
+> and an older binary refuses a schema-3 index too, so rolling back means
+> emptying `INDEX_DIR` and running the older `reindex`. See
+> [documentation.md](./documentation.md#upgrading).
+>
+> Once chat messages are indexed, public search ranking (news ordered by
+> relevance, universal search) changes: relevance statistics are computed
+> over every document in the index, private ones included. Which documents
+> match does not change; their scores and order do, so a page cut by `limit`
+> can differ.
 
 ## Commands
 
 | Command   | Description                                                                 |
 | --------- | --------------------------------------------------------------------------- |
-| `reindex` | Rebuilds the index from PostgreSQL. Needs `DB_URL`. Stop `serve` first.     |
+| `reindex` | Rebuilds the index from PostgreSQL (news, info pages and chat messages). Needs `DB_URL`. Stop `serve` first. |
 | `serve`   | Serves the existing index over HTTP on `127.0.0.1:5000` (default command).  |
 
 | Variable    | Default           | Description                          |
@@ -61,8 +77,11 @@ cargo run --release -- serve
 | `POST`   | `/index/upsert`       | Insert or replace a document.                   |
 | `POST`   | `/index/upsert/batch` | Insert or replace many documents in one commit. |
 | `DELETE` | `/index/delete`       | Delete a document by `tipo` + `id`.             |
-| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=`).  |
-| `GET`    | `/health`             | Liveness check: `{ "ok": true, "docs": N }`.    |
+| `DELETE` | `/index/delete/thread` | Delete every document of a conversation.       |
+| `DELETE` | `/index/delete/tipo`  | Delete every document of a `tipo`.              |
+| `GET`    | `/search`             | Full-text search (`?q=&tipo=&limit=&offset=&acl=&prefix=`). |
+| `GET`    | `/stats`              | Document counts, in total and per `tipo`.       |
+| `GET`    | `/health`             | Liveness, document count, schema version and supported features. |
 
 ### Example
 
@@ -74,6 +93,9 @@ curl -X POST http://127.0.0.1:5000/index/upsert \
 
 # Search
 curl "http://127.0.0.1:5000/search?q=hola&tipo=noticia&limit=5"
+
+# Search what employee usr-emp-001 may see
+curl "http://127.0.0.1:5000/search?q=turnos&tipo=chat_msg&acl=u:usr-emp-001"
 
 # Delete
 curl -X DELETE http://127.0.0.1:5000/index/delete \
@@ -105,7 +127,8 @@ fields are array-valued and `contenido` is searchable but not returned).
 - The server binds to `127.0.0.1` by default and has **no authentication** —
   keep it behind your backend or a proxy.
 - `serve` requires that `reindex` has been run at least once.
-- All document fields are strings.
+- All document fields are strings, except `acl`, a list of strings; a
+  document without `acl` is public.
 - `limit` is capped at 1000, `offset` at 10000 and `q` at 1000 characters.
 
 ## License

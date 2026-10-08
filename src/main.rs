@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::process::ExitCode;
 
+mod acl;
 mod error;
 mod indexer;
 mod init;
@@ -10,6 +11,7 @@ mod searcher;
 mod server;
 mod spanish_plural;
 mod state;
+mod stats;
 mod utils;
 
 #[cfg(test)]

@@ -6,10 +6,13 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::indexer::{delete_document, upsert_document, upsert_documents};
-use crate::init::{explain_lock_error, open_index};
+use crate::indexer::{
+    delete_document, delete_thread, delete_tipo, upsert_document, upsert_documents,
+};
+use crate::init::{SCHEMA_VERSION, explain_lock_error, open_index};
 use crate::searcher::search_documents;
 use crate::state::AppState;
+use crate::stats::stats;
 use crate::utils::*;
 
 /// Tamaño máximo del cuerpo de los upserts. El de axum por defecto (2 MB), que
@@ -17,16 +20,30 @@ use crate::utils::*;
 /// documentos largos, que `reindex` sí indexa sin límite.
 pub const MAX_UPSERT_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Lo que sabe hacer esta versión. El backend lo consulta antes de mandar
+/// documentos de chat: un indexer sin `acl` los dejaría públicos.
+pub const FEATURES: &[&str] = &[
+    "acl",
+    "thread",
+    "stats",
+    "prefix",
+    "delete_thread",
+    "delete_tipo",
+];
+
 pub fn router(state: AppState) -> Router {
     let upsert_limit = DefaultBodyLimit::max(MAX_UPSERT_BODY_BYTES);
     Router::new()
         .route("/health", get(health))
+        .route("/stats", get(stats))
         .route("/index/upsert", post(upsert_document).layer(upsert_limit))
         .route(
             "/index/upsert/batch",
             post(upsert_documents).layer(upsert_limit),
         )
         .route("/index/delete", delete(delete_document))
+        .route("/index/delete/thread", delete(delete_thread))
+        .route("/index/delete/tipo", delete(delete_tipo))
         .route("/search", get(search_documents))
         .with_state(state)
 }
@@ -58,12 +75,16 @@ pub async fn start_server() -> Result<()> {
 pub struct HealthResponse {
     pub ok: bool,
     pub docs: u64,
+    pub schema: u32,
+    pub features: &'static [&'static str],
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         docs: state.reader.searcher().num_docs(),
+        schema: SCHEMA_VERSION,
+        features: FEATURES,
     })
 }
 

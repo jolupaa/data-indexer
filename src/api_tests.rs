@@ -7,7 +7,12 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tantivy::Index;
+use tantivy::{
+    Index, TantivyDocument, Term,
+    collector::TopDocs,
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{IndexRecordOption, Value as _},
+};
 use tower::ServiceExt;
 
 use crate::init::{build_schema, register_tokenizers};
@@ -15,11 +20,15 @@ use crate::searcher::MAX_QUERY_CHARS;
 use crate::server::router;
 use crate::state::AppState;
 
-fn test_app() -> Router {
+fn test_state() -> AppState {
     let (schema, fields) = build_schema();
     let index = Index::create_in_ram(schema);
     register_tokenizers(&index);
-    router(AppState::new(index, fields).unwrap())
+    AppState::new(index, fields).unwrap()
+}
+
+fn test_app() -> Router {
+    router(test_state())
 }
 
 async fn send(
@@ -62,6 +71,17 @@ fn noticia(id: &str, titulo: &str) -> Value {
         "subtitulo": "",
         "contenido": "",
         "fecha": "2026-06-16",
+    })
+}
+
+fn chat(id: &str, thread: &str, contenido: &str, acl: &[&str]) -> Value {
+    json!({
+        "id": id,
+        "tipo": "chat_msg",
+        "thread": thread,
+        "contenido": contenido,
+        "fecha": "2026-10-03T08:42:00",
+        "acl": acl,
     })
 }
 
@@ -289,12 +309,15 @@ async fn only_upserts_accept_large_bodies() {
 }
 
 #[tokio::test]
-async fn health_reports_document_count() {
+async fn health_reports_documents_schema_and_features() {
     let app = test_app();
     upsert(&app, noticia("1", "uno")).await;
     let (status, body) = send(&app, Method::GET, "/health", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, r#"{"ok":true,"docs":1}"#);
+    assert_eq!(
+        body,
+        r#"{"ok":true,"docs":1,"schema":3,"features":["acl","thread","stats","prefix","delete_thread","delete_tipo"]}"#
+    );
 }
 
 #[tokio::test]
@@ -321,4 +344,654 @@ async fn deeply_nested_queries_do_not_hang_the_server() {
     let too_long = format!("q={}", "a".repeat(MAX_QUERY_CHARS + 1));
     let (status, _) = send(&app, Method::GET, &format!("/search?{too_long}"), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upsert_rejects_invalid_acl_and_thread() {
+    let app = test_app();
+    let too_many: Vec<String> = (0..33).map(|i| format!("u:{i}")).collect();
+    for bad in [
+        json!({"id": "1", "tipo": "chat_msg", "acl": [""]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": ["x".repeat(257)]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": ["u:a b"]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": ["u:a,b"]}),
+        json!({"id": "1", "tipo": "chat_msg", "acl": too_many}),
+        json!({"id": "1", "tipo": "chat_msg", "thread": "   "}),
+        json!({"id": "1", "tipo": "chat_msg", "thread": "t".repeat(1025)}),
+    ] {
+        let (status, body) = send(&app, Method::POST, "/index/upsert", Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+
+    // `acl` es una lista de strings, no un string.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/index/upsert",
+        Some(json!({"id": "1", "tipo": "chat_msg", "acl": "u:1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 32 valores de 256 bytes justos sí valen.
+    let at_the_limit: Vec<String> = (0..32)
+        .map(|i| format!("u:{i:02}{}", "x".repeat(252)))
+        .collect();
+    upsert(
+        &app,
+        json!({"id": "2", "tipo": "chat_msg", "acl": at_the_limit}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn batch_names_the_item_with_an_invalid_acl() {
+    let app = test_app();
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/index/upsert/batch",
+        Some(json!([
+            {"id": "1", "tipo": "chat_msg", "acl": ["u:1"], "contenido": "lote"},
+            {"id": "2", "tipo": "chat_msg", "acl": ["u:1 "], "contenido": "lote"},
+        ])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.starts_with("[1]: "), "{body}");
+}
+
+#[tokio::test]
+async fn results_carry_thread_but_never_acl() {
+    let app = test_app();
+    // Sin `acl` es público, así que la búsqueda por defecto lo encuentra.
+    upsert(
+        &app,
+        json!({
+            "id": "7101",
+            "tipo": "chat_msg",
+            "thread": "dev-thread-maria",
+            "contenido": "calendario",
+        }),
+    )
+    .await;
+    let results = search(&app, "q=calendario").await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["doc"]["thread"], json!(["dev-thread-maria"]));
+    assert!(results[0]["doc"].get("acl").is_none());
+
+    upsert(&app, noticia("1", "sin hilo")).await;
+    let results = search(&app, "q=hilo").await;
+    assert_eq!(results.len(), 1);
+    assert!(results[0]["doc"].get("thread").is_none());
+}
+
+#[tokio::test]
+async fn acl_hides_documents_without_a_matching_principal() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos de octubre")).await;
+    upsert(
+        &app,
+        chat(
+            "7101",
+            "t-ana",
+            "turnos de octubre",
+            &["u:usr-ana", "a:usr-laura"],
+        ),
+    )
+    .await;
+    upsert(
+        &app,
+        chat("7102", "t-bob", "turnos de octubre", &["u:usr-bob"]),
+    )
+    .await;
+
+    // Sin `acl`, sólo lo público.
+    assert_eq!(ids(&search(&app, "q=turnos").await), ["1"]);
+    assert_eq!(ids(&search(&app, "q=turnos&acl=public").await), ["1"]);
+    // Cada principal ve lo suyo y nada más.
+    assert_eq!(ids(&search(&app, "q=turnos&acl=u:usr-ana").await), ["7101"]);
+    assert_eq!(
+        ids(&search(&app, "q=turnos&acl=a:usr-laura").await),
+        ["7101"]
+    );
+    assert_eq!(ids(&search(&app, "q=turnos&acl=u:usr-bob").await), ["7102"]);
+    assert!(search(&app, "q=turnos&acl=u:usr-carla").await.is_empty());
+    // Varios principales: lo que ve cualquiera de ellos.
+    assert_eq!(
+        ids(&search(&app, "q=turnos&acl=u:usr-ana,public").await),
+        ["1", "7101"]
+    );
+    assert_eq!(
+        ids(&search(&app, "q=turnos&acl=u:usr-ana,a:usr-ana").await),
+        ["7101"]
+    );
+
+    // El resultado lleva el thread y nunca la acl.
+    let results = search(&app, "q=turnos&acl=u:usr-ana").await;
+    assert_eq!(results[0]["doc"]["thread"], json!(["t-ana"]));
+    assert!(results[0]["doc"].get("acl").is_none());
+}
+
+#[tokio::test]
+async fn query_syntax_cannot_widen_access() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(&app, chat("7101", "t-ana", "turnos", &["u:usr-ana"])).await;
+
+    // Cada `q` llega a 7101: su dueña lo encuentra. Así, si nadie más lo ve es
+    // por el filtro de `acl`, y no porque la consulta no case con él.
+    for q in [
+        "*",
+        "turnos",
+        // Comillas sin cerrar: se busca como texto plano.
+        "%22turnos",
+        "*%20-x",
+        "acl:%22u%3Ausr-ana%22",
+        "acl:public%20OR%20turnos",
+        "tipo:chat_msg",
+        "thread:t-ana",
+        "id:7101",
+        "turnos%20OR%20acl:%22u%3Ausr-ana%22",
+        "*%20OR%20tipo:chat_msg",
+        "%2Bturnos%20-acl:public",
+    ] {
+        let owner = format!("q={q}&acl=u:usr-ana");
+        let found = ids(&search(&app, &owner).await);
+        assert!(found.contains(&"7101".to_string()), "{owner}: {found:?}");
+        for extra in ["", "&acl=public", "&acl=u:usr-bob", "&tipo=chat_msg"] {
+            let uri = format!("q={q}{extra}");
+            let found = ids(&search(&app, &uri).await);
+            assert!(!found.contains(&"7101".to_string()), "{uri}: {found:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn search_validates_acl() {
+    let app = test_app();
+    upsert(&app, noticia("1", "hola")).await;
+    let too_many = vec!["u:1"; 65].join(",");
+    let too_long = "x".repeat(257);
+    for bad in [
+        "acl=".to_string(),
+        "acl=u:1,".to_string(),
+        "acl=u:1,,u:2".to_string(),
+        "acl=u%3Aa%20b".to_string(),
+        "acl=u:1&acl=u:2".to_string(),
+        format!("acl={too_many}"),
+        format!("acl={too_long}"),
+        // Aunque `limit=0` no busque nada, un `acl` inválido es un error.
+        "acl=&limit=0".to_string(),
+    ] {
+        let uri = format!("/search?q=hola&{bad}");
+        let (status, body) = send(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+
+    let mut at_the_limit = vec!["u:1"; 63];
+    at_the_limit.push("public");
+    let uri = format!("q=hola&acl={}", at_the_limit.join(","));
+    assert_eq!(ids(&search(&app, &uri).await), ["1"]);
+}
+
+/// (id, puntuación) de la consulta de v2 —el texto y, si hay, el filtro por
+/// `tipo`— ejecutada directamente sobre el índice, sin ACL. La puntuación va
+/// como la escribe serde_json, para comparar los f32 bit a bit.
+fn v2_scores(state: &AppState, q: &str, tipo: Option<&str>) -> Vec<(String, String)> {
+    let parser = QueryParser::for_index(&state.index, state.fields.full_text());
+    let text = parser.parse_query(q).unwrap();
+    let query: Box<dyn Query> = match tipo {
+        Some(tipo) => Box::new(BooleanQuery::new(vec![
+            (Occur::Must, text),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(state.fields.tipo, tipo),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ])),
+        None => text,
+    };
+    let searcher = state.reader.searcher();
+    searcher
+        .search(&*query, &TopDocs::with_limit(100))
+        .unwrap()
+        .into_iter()
+        .map(|(score, address)| {
+            let doc: TantivyDocument = searcher.doc(address).unwrap();
+            let id = doc.get_first(state.fields.id).unwrap().as_str().unwrap();
+            (id.to_string(), serde_json::to_string(&score).unwrap())
+        })
+        .collect()
+}
+
+fn scores(results: &[Value]) -> Vec<(String, String)> {
+    results
+        .iter()
+        .map(|r| {
+            let id = r["doc"]["id"][0].as_str().unwrap().to_string();
+            (id, r["score"].to_string())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn without_acl_results_and_scores_are_those_of_v2() {
+    let state = test_state();
+    let app = router(state.clone());
+    upsert(&app, noticia("1", "Presupuesto anual")).await;
+    upsert(&app, noticia("2", "Presupuesto")).await;
+    upsert(
+        &app,
+        noticia("3", "Presupuesto del presupuesto anual de la empresa"),
+    )
+    .await;
+    upsert(
+        &app,
+        json!({"id": "4", "tipo": "info_doc", "titulo": "Anual", "info_title": "Presupuestos"}),
+    )
+    .await;
+    // Documentos privados que también casan. No salen, pero están en el índice
+    // y cuentan en las estadísticas de BM25 (número de documentos, documentos
+    // con cada término, longitud media de cada campo): la consulta y las
+    // puntuaciones son las de v2 sobre este mismo índice, no las de un índice
+    // sin ellos. Añadir documentos privados cambia las puntuaciones de los
+    // públicos y puede cambiar su orden.
+    upsert(&app, chat("c1", "t1", "presupuesto anual", &["u:usr-ana"])).await;
+    upsert(&app, chat("c2", "t1", "presupuesto", &["u:usr-ana"])).await;
+
+    for (q, uri_q, tipo) in [
+        ("presupuesto", "presupuesto", None),
+        ("presupuesto anual", "presupuesto%20anual", None),
+        ("\"presupuesto anual\"", "%22presupuesto%20anual%22", None),
+        ("titulo:presupuesto", "titulo:presupuesto", None),
+        ("presupuesto -empresa", "presupuesto%20-empresa", None),
+        ("*", "*", None),
+        ("presupuesto", "presupuesto", Some("noticia")),
+        ("*", "*", Some("info_doc")),
+    ] {
+        let expected: Vec<(String, String)> = v2_scores(&state, q, tipo)
+            .into_iter()
+            .filter(|(id, _)| !id.starts_with('c'))
+            .collect();
+        assert!(!expected.is_empty(), "{q}");
+        let tipo_param = tipo.map(|t| format!("&tipo={t}")).unwrap_or_default();
+        for acl_param in ["", "&acl=public"] {
+            let uri = format!("q={uri_q}&limit=100{tipo_param}{acl_param}");
+            assert_eq!(scores(&search(&app, &uri).await), expected, "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn reupserting_with_a_new_acl_revokes_the_old_principals() {
+    let app = test_app();
+    upsert(
+        &app,
+        chat("7101", "t1", "turnos", &["u:usr-ana", "a:usr-laura"]),
+    )
+    .await;
+
+    // Reasignación: el hilo pasa de Laura a Pedro.
+    upsert(
+        &app,
+        chat("7101", "t1", "turnos", &["u:usr-ana", "a:usr-pedro"]),
+    )
+    .await;
+    assert!(search(&app, "q=turnos&acl=a:usr-laura").await.is_empty());
+    assert_eq!(
+        ids(&search(&app, "q=turnos&acl=a:usr-pedro").await),
+        ["7101"]
+    );
+
+    // Lo mismo por lotes.
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/index/upsert/batch",
+        Some(json!([chat(
+            "7101",
+            "t1",
+            "turnos",
+            &["u:usr-ana", "a:usr-marta"]
+        )])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(search(&app, "q=turnos&acl=a:usr-pedro").await.is_empty());
+    assert_eq!(
+        ids(&search(&app, "q=turnos&acl=a:usr-marta").await),
+        ["7101"]
+    );
+    assert_eq!(ids(&search(&app, "q=turnos&acl=u:usr-ana").await), ["7101"]);
+}
+
+#[tokio::test]
+async fn principals_match_exactly() {
+    let app = test_app();
+    upsert(&app, chat("1", "t1", "turnos", &["u:12"])).await;
+    upsert(&app, chat("2", "t2", "turnos", &["u:ABC"])).await;
+
+    assert_eq!(ids(&search(&app, "q=turnos&acl=u:12").await), ["1"]);
+    assert_eq!(ids(&search(&app, "q=turnos&acl=u:ABC").await), ["2"]);
+    // Ni prefijos, ni mayúsculas/minúsculas, ni otro rol con el mismo id.
+    for acl in ["u:1", "u:123", "u:", "u", "a:12", "u:abc", "U:ABC", "u:AB"] {
+        let uri = format!("q=turnos&acl={acl}");
+        assert!(search(&app, &uri).await.is_empty(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn prefix_expands_only_the_last_word() {
+    let app = test_app();
+    upsert(&app, noticia("1", "Nómina de septiembre")).await;
+    upsert(&app, noticia("2", "Recibo de nóminas pendientes")).await;
+
+    // Sin `prefix`, como en v2: una palabra a medias no casa.
+    assert!(search(&app, "q=nomi").await.is_empty());
+    assert!(search(&app, "q=nomi&prefix=false").await.is_empty());
+
+    assert_eq!(ids(&search(&app, "q=nomi&prefix=true").await), ["1", "2"]);
+    assert_eq!(ids(&search(&app, "q=septiem&prefix=true").await), ["1"]);
+    // Sólo la última palabra es un prefijo: "nomi" no casa como palabra.
+    assert_eq!(ids(&search(&app, "q=nomi%20sept&prefix=true").await), ["1"]);
+    // Con menos de 3 caracteres no se expande.
+    assert!(search(&app, "q=no&prefix=true").await.is_empty());
+
+    let (status, _) = send(&app, Method::GET, "/search?q=nomi&prefix=si", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn exact_matches_rank_above_prefix_only_matches() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(&app, noticia("2", "turn")).await;
+
+    let results = search(&app, "q=turn&prefix=true").await;
+    assert_eq!(ids(&results), ["1", "2"]);
+    assert_eq!(results[0]["doc"]["id"], json!(["2"]));
+}
+
+#[tokio::test]
+async fn prefix_matches_respect_acl_and_tipo() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(
+        &app,
+        chat("7101", "t1", "turnos de octubre", &["u:usr-ana"]),
+    )
+    .await;
+
+    assert_eq!(ids(&search(&app, "q=tur&prefix=true").await), ["1"]);
+    assert_eq!(
+        ids(&search(&app, "q=tur&prefix=true&acl=u:usr-ana").await),
+        ["7101"]
+    );
+    assert!(
+        search(&app, "q=tur&prefix=true&acl=u:usr-bob")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        ids(&search(&app, "q=tur&prefix=true&acl=u:usr-ana,public&tipo=noticia").await),
+        ["1"]
+    );
+}
+
+#[tokio::test]
+async fn prefix_ignores_case_accents_and_a_trailing_space() {
+    let app = test_app();
+    upsert(&app, noticia("1", "Nómina de septiembre")).await;
+
+    for q in [
+        "NOMI",
+        "N%C3%B3mi",  // "Nómi"
+        "No%CC%81mi", // "Nómi" en NFD
+        "nomi%20",    // espacio al final
+        "N%C3%93MINAS",
+        "%22nomi", // comillas sin cerrar
+    ] {
+        let uri = format!("q={q}&prefix=true");
+        assert_eq!(ids(&search(&app, &uri).await), ["1"], "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn prefix_continues_a_partial_word_ending_in_z() {
+    let app = test_app();
+    upsert(&app, noticia("1", "Actualización de nóminas")).await;
+    upsert(&app, noticia("2", "Organización del evento")).await;
+    upsert(&app, noticia("3", "Autorizaciones pendientes")).await;
+    upsert(&app, noticia("4", "Plaza mayor")).await;
+    upsert(&app, noticia("5", "Placa base")).await;
+    upsert(&app, noticia("6", "Luces de Navidad")).await;
+
+    for (q, expected) in [
+        ("actualiz", "1"),
+        ("ACTUALIZ", "1"),
+        ("actualiza", "1"),
+        ("organiz", "2"),
+        ("autoriz", "3"),
+        ("autori", "3"),
+        // "plaz" sigue por "plaza", no por "placa".
+        ("plaz", "4"),
+        // Una palabra entera acabada en `z` sigue casando con su plural.
+        ("luz", "6"),
+    ] {
+        let uri = format!("q={q}&prefix=true");
+        assert_eq!(ids(&search(&app, &uri).await), [expected], "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn prefix_with_nothing_to_expand_returns_nothing() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(&app, chat("7101", "t1", "turnos", &["u:usr-ana"])).await;
+
+    for q in ["", "%20%20", "%22", "-", "%3A%3A", "tu", "%C2%BF%3F"] {
+        for acl in ["", "&acl=u:usr-ana"] {
+            let uri = format!("q={q}&prefix=true{acl}");
+            assert!(search(&app, &uri).await.is_empty(), "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn delete_thread_removes_the_whole_conversation() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    for (id, thread) in [("7101", "t-ana"), ("7102", "t-ana"), ("7201", "t-bob")] {
+        upsert(
+            &app,
+            chat(id, thread, "turnos", &["u:usr-ana", "u:usr-bob"]),
+        )
+        .await;
+    }
+    let everything = "q=turnos&acl=u:usr-ana,u:usr-bob,public";
+
+    let (status, body) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete/thread",
+        Some(json!({"thread": "t-ana"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, r#"{"ok":true}"#);
+    assert_eq!(ids(&search(&app, everything).await), ["1", "7201"]);
+
+    // Una conversación que no existe no es un error, y el thread se compara
+    // tal cual: " t-bob " no es "t-bob".
+    for thread in ["no-existe", " t-bob "] {
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            "/index/delete/thread",
+            Some(json!({ "thread": thread })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(ids(&search(&app, everything).await), ["1", "7201"]);
+}
+
+#[tokio::test]
+async fn delete_tipo_removes_a_whole_corpus() {
+    let app = test_app();
+    upsert(&app, noticia("1", "turnos")).await;
+    upsert(
+        &app,
+        json!({"id": "1", "tipo": "info_doc", "titulo": "turnos"}),
+    )
+    .await;
+    upsert(&app, chat("7101", "t-ana", "turnos", &["u:usr-ana"])).await;
+    upsert(&app, chat("7201", "t-bob", "turnos", &["u:usr-bob"])).await;
+
+    // El tipo se recorta, como al indexar.
+    let (status, body) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete/tipo",
+        Some(json!({"tipo": " chat_msg "})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, r#"{"ok":true}"#);
+
+    let results = search(&app, "q=turnos&acl=u:usr-ana,u:usr-bob,public").await;
+    let mut tipos: Vec<&str> = results
+        .iter()
+        .map(|r| r["doc"]["tipo"][0].as_str().unwrap())
+        .collect();
+    tipos.sort();
+    assert_eq!(tipos, ["info_doc", "noticia"]);
+}
+
+#[tokio::test]
+async fn deletes_by_thread_and_tipo_validate_their_input() {
+    let app = test_app();
+    for (uri, bad) in [
+        ("/index/delete/thread", json!({"thread": ""})),
+        ("/index/delete/thread", json!({"thread": "   "})),
+        ("/index/delete/thread", json!({"thread": "t".repeat(1025)})),
+        ("/index/delete/tipo", json!({"tipo": ""})),
+        ("/index/delete/tipo", json!({"tipo": "   "})),
+        ("/index/delete/tipo", json!({"tipo": "a:b"})),
+        ("/index/delete/tipo", json!({"tipo": "t".repeat(1025)})),
+    ] {
+        let (status, body) = send(&app, Method::DELETE, uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {bad}: {body}");
+    }
+    for (uri, bad) in [
+        ("/index/delete/thread", json!({})),
+        ("/index/delete/thread", json!({"thread": 7})),
+        ("/index/delete/tipo", json!({"thread": "t-ana"})),
+    ] {
+        let (status, _) = send(&app, Method::DELETE, uri, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri} {bad}");
+    }
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/index/delete/thread",
+        Some(json!({"thread": "t-ana"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+async fn stats(app: &Router) -> Value {
+    let (status, body) = send(app, Method::GET, "/stats", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test]
+async fn stats_on_an_empty_index_reports_every_known_corpus() {
+    let app = test_app();
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 0, "by_tipo": {"noticia": 0, "info_doc": 0, "chat_msg": 0}})
+    );
+}
+
+#[tokio::test]
+async fn stats_counts_live_documents_per_tipo() {
+    let app = test_app();
+    upsert(&app, noticia("1", "uno")).await;
+    upsert(&app, noticia("2", "dos")).await;
+    upsert(&app, noticia("1", "uno, otra vez")).await; // sustituye al 1
+    upsert(
+        &app,
+        json!({"id": "1", "tipo": "info_doc", "titulo": "info"}),
+    )
+    .await;
+    upsert(&app, chat("7101", "t1", "hola", &["u:usr-ana"])).await;
+    upsert(&app, chat("7102", "t1", "hola", &["u:usr-ana"])).await;
+    upsert(&app, chat("7201", "t2", "hola", &["u:usr-bob"])).await;
+    upsert(&app, json!({"id": "x", "tipo": "otro"})).await;
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete",
+        Some(json!({"id": "2", "tipo": "noticia"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/index/delete/thread",
+        Some(json!({"thread": "t2"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 5, "by_tipo": {"noticia": 1, "info_doc": 1, "chat_msg": 2, "otro": 1}})
+    );
+
+    // Un tipo vaciado desaparece; los conocidos se quedan, con 0.
+    for tipo in ["otro", "chat_msg"] {
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            "/index/delete/tipo",
+            Some(json!({ "tipo": tipo })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 2, "by_tipo": {"noticia": 1, "info_doc": 1, "chat_msg": 0}})
+    );
+}
+
+#[tokio::test]
+async fn resending_a_message_counts_and_shows_it_once() {
+    let app = test_app();
+    let message = chat("7101", "t1", "turnos", &["u:usr-ana", "a:usr-laura"]);
+    // Reintentos del outbox: el mismo mensaje, suelto y dos veces en un lote.
+    upsert(&app, message.clone()).await;
+    upsert(&app, message.clone()).await;
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/index/upsert/batch",
+        Some(json!([message.clone(), message.clone()])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        stats(&app).await,
+        json!({"total": 1, "by_tipo": {"noticia": 0, "info_doc": 0, "chat_msg": 1}})
+    );
+    assert_eq!(search(&app, "q=turnos&acl=u:usr-ana").await.len(), 1);
 }
